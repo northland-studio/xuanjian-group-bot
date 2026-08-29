@@ -262,12 +262,10 @@ export function registerAllCommands() {
     }
   });
 
-  // ==================== 核销（私聊，管理员） ====================
-  registerCommand('核销', ['hexiao', 'verify'], '核销码验证（管理员私聊）：核销 <码>', async ({ text: args, userId, isPrivate, reply }) => {
-    if (!isPrivate) return reply('核销为敏感操作，请私聊机器人使用。');
-    if (!requireAdmin(userId, reply)) return;
+  // ==================== 核销查询（群内开放，普通成员可查核销信息/状态） ====================
+  registerCommand('核销', ['hexiao', 'verify'], '查询核销码信息与状态：核销 <码>', async ({ text: args, reply }) => {
     if (!args) return reply('用法：核销 <核销码>');
-    const r = await api.verifyCode(args, userId);
+    const r = await api.verifyCode(args);
     if (!r) return reply('核销服务不可用，请稍后再试。');
     if (r.error) return reply(`核销失败：${r.error}`);
     const it = r.item || {};
@@ -276,14 +274,14 @@ export function registerAllCommands() {
       `商品：${it.name || ''}`,
       `买家：${it.buyer || ''}`,
       `购买时间：${(it.purchasedAt || '').slice(0, 10)}`,
-      r.already ? '⚠ 该码已核销' : `剩余待核销：${r.remaining ?? r.quantity ?? 1}`,
+      r.already ? `✅ 状态：已核销（${(r.verifiedAt || '').slice(0, 16)}）` : `⏳ 状态：待核销，剩余 ${r.remaining ?? r.quantity ?? 1} 件`,
     ];
-    if (!r.already) info.push('确认无误请回复：核销确认 <码>');
+    if (!r.already) info.push('提示：核销确认需管理员操作。');
     reply(info.filter(Boolean).join('\n'));
   });
 
   registerCommand('核销确认', ['hexiaoqr', 'confirm'], '确认核销（管理员私聊）：核销确认 <码>', async ({ text: args, userId, isPrivate, reply }) => {
-    if (!isPrivate) return reply('核销为敏感操作，请私聊机器人使用。');
+    if (!isPrivate) return reply('核销确认为敏感操作，请私聊管理员使用。');
     if (!requireAdmin(userId, reply)) return;
     if (!args) return reply('用法：核销确认 <核销码>');
     const r = await api.confirmCode(args, userId);

@@ -99,12 +99,13 @@ export async function getPosts(type: string, limit = 5) {
 }
 
 /**
- * 核销码验证（管理员私聊操作）
+ * 核销码验证（群内普通成员可查核销信息与状态）
  * 依赖官网 bot-token 接口 /api/qqbot/verify-code
+ * 核销码绑定消费用户，持码即可查询，无需身份验证。
  * 返回 { valid, item?, already?, error? } 或 null。
  */
-export async function verifyCode(code: string, qq: string) {
-  return post<any>(`/api/qqbot/verify-code`, { code, qq });
+export async function verifyCode(code: string) {
+  return post<any>(`/api/qqbot/verify-code`, { code });
 }
 
 /**
