@@ -3,7 +3,7 @@
  * 通过官网开放接口读取档案 / 处分 / 排行榜等数据。
  * 机器人不直连官网数据库，统一走 HTTP。
  */
-import { config } from '../config';
+import { config } from '../config.js';
 
 /** 通用请求：GET 官网接口，返回 JSON；失败返回 null */
 async function get<T = any>(path: string): Promise<T | null> {

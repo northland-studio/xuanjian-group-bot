@@ -3,9 +3,9 @@
  * 基于 node-napcat-ts 正向连接 NapCatQQ。
  */
 import { NCWebsocket, Structs } from 'node-napcat-ts';
-import { config, isAllowedGroup } from './config';
-import { parseCommand } from './core/command';
-import { registerAllCommands } from './handlers/commands';
+import { config, isAllowedGroup } from './config.js';
+import { parseCommand } from './core/command.js';
+import { registerAllCommands } from './handlers/commands.js';
 import type { GroupMessage, GroupIncreaseApprove, GroupIncreaseInvite, PrivateFriendMessage, SendMessageSegment } from 'node-napcat-ts';
 
 async function main() {

@@ -1,8 +1,8 @@
 /**
  * 群指令实现（MVP 公开查询）
  */
-import { registerCommand, getCommands } from '../core/command';
-import * as api from '../services/officialApi';
+import { registerCommand, getCommands } from '../core/command.js';
+import * as api from '../services/officialApi.js';
 
 /** 格式化贡献点（两位小数） */
 function fmt(n: number | string | null | undefined): string {
