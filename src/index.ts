@@ -8,6 +8,14 @@ import { parseCommand } from './core/command.js';
 import { registerAllCommands } from './handlers/commands.js';
 import type { GroupMessage, GroupIncreaseApprove, GroupIncreaseInvite, PrivateFriendMessage, SendMessageSegment } from 'node-napcat-ts';
 
+// ===== 全局错误兜底：记录完整堆栈，避免静默退出 =====
+process.on('uncaughtException', (e) => {
+  console.error('[bot][uncaughtException]', e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[bot][unhandledRejection]', e);
+});
+
 async function main() {
   console.log('[bot] 玄剑公会群机器人启动中...');
 
@@ -79,12 +87,12 @@ async function main() {
   });
 
   // 优雅退出
-  const shutdown = () => {
-    console.log('[bot] 正在退出...');
+  const shutdown = (sig?: string) => {
+    console.log(`[bot] 收到信号 ${sig}，正在退出...`);
     napcat.disconnect().finally(() => process.exit(0));
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   // 连接 NapCat（失败自动重试，等待 NapCat 上线）
   const CONNECT_RETRY_MS = 10000;
@@ -98,6 +106,19 @@ async function main() {
     }
   }
   console.log(`[bot] 已连接 NapCat（${config.napcat.baseUrl || `${config.napcat.host}:${config.napcat.port}`}）`);
+
+  // 保持进程存活：确保事件循环有活跃句柄，避免 main() 返回后进程退出
+  // 同时监听 NapCat 连接断开，便于排查
+  setInterval(() => {
+    // 心跳占位（保持事件循环活跃）
+  }, 60000);
+
+  // 连接断开日志（通过事件）
+  napcat.on('socket.close', () => console.log('[bot] NapCat 连接已关闭'));
+  napcat.on('socket.error', (e: any) => console.error('[bot] NapCat 连接错误:', e));
+
+  // 永不 resolve，保持 main() 挂起
+  await new Promise<void>(() => {});
 }
 
 main().catch((e) => {
