@@ -91,3 +91,34 @@ export async function onlinePlayers() {
   const d = await get<any>(`/api/mod/online`);
   return d?.players || [];
 }
+
+/** 拉取官网帖子（type: daily 日报 / decision 决策，公开接口） */
+export async function getPosts(type: string, limit = 5) {
+  const d = await get<any>(`/api/posts?type=${encodeURIComponent(type)}&limit=${limit}&page=1`);
+  return d?.posts || [];
+}
+
+/**
+ * 核销码验证（管理员私聊操作）
+ * 依赖官网 bot-token 接口 /api/qqbot/verify-code
+ * 返回 { valid, item?, already?, error? } 或 null。
+ */
+export async function verifyCode(code: string, qq: string) {
+  return post<any>(`/api/qqbot/verify-code`, { code, qq });
+}
+
+/**
+ * 核销确认（管理员私聊操作）
+ * 依赖官网 bot-token 接口 /api/qqbot/confirm-code
+ */
+export async function confirmCode(code: string, qq: string) {
+  return post<any>(`/api/qqbot/confirm-code`, { code, qq });
+}
+
+/**
+ * 玩家任务验证码完成（接取者私聊提交）
+ * 依赖官网 bot-token 接口 /api/qqbot/task-complete
+ */
+export async function completePlayerTask(taskId: string, code: string, qq: string) {
+  return post<any>(`/api/qqbot/task-complete`, { taskId, code, qq });
+}

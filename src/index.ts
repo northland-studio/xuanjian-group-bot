@@ -6,6 +6,7 @@ import { NCWebsocket, Structs } from 'node-napcat-ts';
 import { config, isAllowedGroup } from './config.js';
 import { parseCommand } from './core/command.js';
 import { registerAllCommands } from './handlers/commands.js';
+import { recordActivity } from './services/activity.js';
 import type { GroupMessage, GroupIncreaseApprove, GroupIncreaseInvite, PrivateFriendMessage, SendMessageSegment } from 'node-napcat-ts';
 
 // ===== 全局错误兜底：记录完整堆栈，避免静默退出 =====
@@ -42,12 +43,21 @@ async function main() {
       const userId = String(ctx.user_id);
       const raw = Array.isArray(ctx.message) ? ctx.message.map((m) => (m as any).data?.text ?? '').join('') : String(ctx.message);
       const parsed = parseCommand(raw, false);
+      // 记录群活跃（无论是否指令）
+      recordActivity(groupId, userId, ctx.sender?.nickname || ctx.sender?.card || '');
       if (!parsed) return;
       const reply = (msg: string) =>
         napcat
           .send('send_group_msg', { group_id: ctx.group_id, message: [Structs.text(msg)] as SendMessageSegment[] })
           .catch(() => {});
-      await parsed.entry.handler({ text: parsed.args, userId, groupId, reply });
+      await parsed.entry.handler({
+        text: parsed.args,
+        userId,
+        groupId,
+        isPrivate: false,
+        reply,
+        client: { send: (m: string, p: Record<string, unknown>) => napcat.send(m as any, p as any) },
+      });
     } catch (e) {
       console.error('[群消息处理错误]', e);
     }
@@ -64,7 +74,13 @@ async function main() {
         napcat
           .send('send_private_msg', { user_id: ctx.user_id, message: [Structs.text(msg)] as SendMessageSegment[] })
           .catch(() => {});
-      await parsed.entry.handler({ text: parsed.args, userId, reply });
+      await parsed.entry.handler({
+        text: parsed.args,
+        userId,
+        isPrivate: true,
+        reply,
+        client: { send: (m: string, p: Record<string, unknown>) => napcat.send(m as any, p as any) },
+      });
     } catch (e) {
       console.error('[私聊消息处理错误]', e);
     }

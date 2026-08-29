@@ -2,7 +2,27 @@
  * 指令系统：注册与分发
  * 群指令前缀为 `#`，私聊指令不带前缀。
  */
-export type CommandHandler = (ctx: { text: string; userId: string; groupId?: string; reply: (msg: string) => void }) => Promise<void> | void;
+export type ReplyFn = (msg: string) => void;
+
+/** 指令处理上下文 */
+export interface CommandContext {
+  /** 指令参数（去头部关键字后的剩余文本） */
+  text: string;
+  /** 发送者 QQ */
+  userId: string;
+  /** 群号（群消息时有） */
+  groupId?: string;
+  /** 是否私聊 */
+  isPrivate: boolean;
+  /** 回复消息（群内回群，私聊回私聊） */
+  reply: ReplyFn;
+  /** 调用 NapCat API（如 send、set_group_ban 等） */
+  client: {
+    send: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  };
+}
+
+export type CommandHandler = (ctx: CommandContext) => Promise<void> | void;
 
 interface CommandEntry {
   name: string;           // 主指令
