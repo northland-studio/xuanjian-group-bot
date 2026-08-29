@@ -78,10 +78,6 @@ async function main() {
     }
   });
 
-  // 连接 NapCat
-  await napcat.connect();
-  console.log(`[bot] 已连接 NapCat（${config.napcat.baseUrl || `${config.napcat.host}:${config.napcat.port}`}）`);
-
   // 优雅退出
   const shutdown = () => {
     console.log('[bot] 正在退出...');
@@ -89,6 +85,19 @@ async function main() {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // 连接 NapCat（失败自动重试，等待 NapCat 上线）
+  const CONNECT_RETRY_MS = 10000;
+  for (;;) {
+    try {
+      await napcat.connect();
+      break;
+    } catch (e) {
+      console.error(`[bot] NapCat 连接失败，${CONNECT_RETRY_MS / 1000}s 后重试:`, (e as Error).message || e);
+      await new Promise((r) => setTimeout(r, CONNECT_RETRY_MS));
+    }
+  }
+  console.log(`[bot] 已连接 NapCat（${config.napcat.baseUrl || `${config.napcat.host}:${config.napcat.port}`}）`);
 }
 
 main().catch((e) => {
