@@ -63,7 +63,7 @@ export function registerAllCommands() {
     const list = await api.checkinRanking(10);
     if (!list.length) return reply('暂无排行数据');
     const lines = ['【签到排行】'];
-    list.forEach((r: any, i: number) => lines.push(`${i + 1}. ${r.nickname || r.username} — 连续 ${r.continuous_days || 0} 天`));
+    list.forEach((r: any, i: number) => lines.push(`${i + 1}. ${r.nickname || r.username} — 连续 ${r.max_continuous_days || 0} 天`));
     reply(lines.join('\n'));
   });
 
