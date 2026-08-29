@@ -73,4 +73,47 @@ export function registerAllCommands() {
     if (!players.length) return reply('当前暂无已绑定的玄剑玩家在线');
     reply(`【在线玩家 ${players.length} 人】\n${players.map((p: any) => p.name).join('、')}`);
   });
+
+  // 绑定（群内发起，生成一次性码去官网确认）
+  registerCommand('绑定', ['bind', 'qqbind'], '绑定QQ与官网账号（生成一次性码）', async ({ text: args, userId, reply }) => {
+    if (!args) return reply('用法：#绑定 <官网用户名或昵称>');
+    if (!userId) return reply('无法获取你的QQ号，请私聊机器人操作');
+    const result = await api.bindQq(userId, args);
+    if (!result) return reply('绑定失败：官网服务不可用或参数错误，请稍后再试');
+    if (result.error) return reply(`绑定失败：${result.error}`);
+    reply(
+      [
+        `已为 QQ ${userId} 发起绑定到账号「${result.nickname || result.username}」。`,
+        `你的 6 位绑定码：${result.code}`,
+        `请到官网「账户设置 → 群机器人绑定」输入绑定码完成确认。`,
+        `（${result.expireMinutes || 10} 分钟内有效）`,
+      ].join('\n'),
+    );
+  });
+
+  // 查自己（按当前 QQ 查绑定档案）
+  registerCommand('查自己', ['me', 'wode', '我的'], '查询自己的档案（需先绑定QQ）', async ({ userId, reply }) => {
+    if (!userId) return reply('无法获取你的QQ号，请私聊机器人操作');
+    const me = await api.getUserByQq(userId);
+    if (!me) return reply('查询失败：官网服务不可用，请稍后再试');
+    if (!me.bound || !me.user) return reply('你尚未绑定官网账号。请在群里发送 #绑定 <用户名>，再按提示到官网确认。');
+    const uid = String(me.user.id);
+    const archive = await api.queryArchive(uid);
+    if (!archive) return reply(`已绑定账号「${me.user.nickname || me.user.username}」，但档案查询失败，请稍后再试`);
+    const u = archive.user || {};
+    const gen = u.generation?.name ? ` | 代系：${u.generation.name}` : '';
+    const dis = (archive.discipline || []).filter((d: any) => d.is_active);
+    const disLine = dis.length ? `\n处分：${dis.length} 条生效记录` : '';
+    reply(
+      [
+        `【${u.nickname || u.username} 的档案】`,
+        `用户ID：${u.id} | 贡献点：${fmt(u.contribution)}${gen}`,
+        `注册：${(u.created_at || '').slice(0, 10)}`,
+        u.is_frozen ? '⚠ 账号冻结' : '',
+        disLine,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  });
 }

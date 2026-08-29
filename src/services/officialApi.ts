@@ -18,6 +18,39 @@ async function get<T = any>(path: string): Promise<T | null> {
   }
 }
 
+/** 通用请求：POST 官网接口，返回 JSON；失败返回 null */
+async function post<T = any>(path: string, body: Record<string, unknown>): Promise<T | null> {
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (config.officialBotToken) headers['X-Bot-Token'] = config.officialBotToken;
+    const resp = await fetch(`${config.officialApiBase}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) return null;
+    return (await resp.json()) as T;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 发起 QQ 绑定：生成一次性绑定码。
+ * 返回 { success, code, username, nickname, expireMinutes } 或 null。
+ */
+export async function bindQq(qq: string, username: string) {
+  return post<any>(`/api/qqbot/bind`, { qq, username });
+}
+
+/**
+ * 按 QQ 查绑定用户（供 #查自己）。
+ * 返回 { bound, user?: { id, username, nickname, qq } } 或 null。
+ */
+export async function getUserByQq(qq: string) {
+  return get<any>(`/api/qqbot/user?qq=${encodeURIComponent(qq)}`);
+}
+
 /** 查询成员档案（GMIRS 单档案） */
 export async function queryArchive(idOrName: string) {
   // 优先按数字 ID 查档案
