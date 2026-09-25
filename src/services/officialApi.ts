@@ -216,3 +216,74 @@ export async function payCharge(
     body: JSON.stringify({ qq, ...payload }),
   });
 }
+
+/**
+ * 缴费单海报图地址（官网公开只读，返回 image/png）。
+ * 海报只含标题/金额/截止/进度/二维码，**不含名单姓名**（隐私），可直接作为图片发送。
+ */
+export function payChargePosterUrl(token: string): string {
+  return `${config.officialSiteBase}/api/pay/render/charge/${encodeURIComponent(String(token))}.png`;
+}
+
+/** 缴费单/支付的网页链接 */
+export function payChargePageUrl(token: string): string {
+  return `${config.officialSiteBase}/pay/charge/${encodeURIComponent(String(token))}`;
+}
+
+/**
+ * 从「链接 / 纯 token / 带说明的整段文本」中提取支付 token。
+ * 与官网 routes/pay.js 的 extractToken 同规则：优先取 /pay/... 或 /charge/... 之后的 16+ 位 token，
+ * 其次退化为整段文本中的第一个 16+ 位 token。
+ */
+export function extractPayToken(input: string): string | null {
+  const s = String(input || '').trim();
+  if (!s) return null;
+  const m = s.match(/\/(?:pay|charge)\/([A-Za-z0-9_-]{16,})/) || s.match(/([A-Za-z0-9_-]{16,})/);
+  return m ? m[1] : null;
+}
+
+/**
+ * 缴费单海报信息（机器人发图用，带鉴权）：
+ * 返回 { ok, data: { token, title, url, pageUrl, stats:{count,paidCount,total,paidSum}, deadline, expired } }
+ * - url 是官网给出的海报图地址，发图优先用它；
+ * - stats 用于催缴文案（已缴人数/金额进度）；
+ * - token 不存在时官网返回 404 { error: '缴费单不存在' }。
+ * token 参数兼容纯 token 与 /pay/charge/<token> 链接（本地先按官网同规则提取一次）。
+ */
+export async function payChargePosterInfo(token: string) {
+  const t = extractPayToken(token) || String(token || '').trim();
+  return requestJson<any>(`/api/qqbot/pay/charge-poster?token=${encodeURIComponent(t)}`);
+}
+
+/**
+ * 取签名临时链接（对账概览等海报图）。
+ * QQ 取图不带请求头，所以不能直接发 /api/qqbot/* 接口，必须先换签名 URL 再发图。
+ * 返回 { ok, data: { url, expiresIn }, error }
+ */
+export async function payRenderUrl(kind: 'summary' | 'charge' = 'summary') {
+  return requestJson<any>(`/api/qqbot/pay/render-url?kind=${encodeURIComponent(kind)}`);
+}
+
+/** 待审批的大额支付（含阈值），仅机器人 token 可读 */
+export async function payPendingApprovals() {
+  return requestJson<any>(`/api/qqbot/pay/pending-approvals`);
+}
+
+/**
+ * 群内审批（管理员）。权限由官网按该 QQ 绑定的官网账号判定：
+ * 非管理员 403、重复审批 409、不存在 404 的错误文案原样回显。
+ */
+export async function payApprove(id: number | string, qq: string, action: 'approve' | 'reject') {
+  return requestJson<any>(`/api/qqbot/pay/approve/${encodeURIComponent(String(id))}`, {
+    method: 'POST',
+    body: JSON.stringify({ qq, action }),
+  });
+}
+
+/**
+ * Minecraft 服务器状态（只读，公开接口）
+ * 官网 `/api/mc/status?server=s115`：在线人数/版本/MOTD/延迟，205s 缓存、115 侧无进程。
+ */
+export async function mcStatus(server = 's115') {
+  return requestJson<any>(`/api/mc/status?server=${encodeURIComponent(server)}`);
+}

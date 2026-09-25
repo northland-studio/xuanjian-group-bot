@@ -40,3 +40,33 @@ export function activityRanking(groupId: string, limit = 10, daysBack = 0): { qq
     .sort((a, b) => b.count - a.count)
     .slice(0, limit);
 }
+
+/**
+ * 汇总最近 N 天（含今天）的活跃排行，供周报使用。
+ * @param days 统计天数，默认 7
+ * @param limit 取前几名
+ */
+export function activityRangeRanking(
+  groupId: string,
+  days = 7,
+  limit = 5,
+): { qq: string; name?: string; count: number; days: number }[] {
+  const data = read<ActivityData>('activity', {});
+  const group = data[groupId];
+  if (!group) return [];
+  const total: Record<string, { name?: string; count: number; days: number }> = {};
+  for (let i = 0; i < days; i++) {
+    const day = group[todayStr(-i)];
+    if (!day) continue;
+    for (const [qq, v] of Object.entries(day)) {
+      if (!total[qq]) total[qq] = { name: v.name, count: 0, days: 0 };
+      total[qq].count += v.count;
+      total[qq].days += 1;
+      if (v.name) total[qq].name = v.name;
+    }
+  }
+  return Object.entries(total)
+    .map(([qq, v]) => ({ qq, name: v.name, count: v.count, days: v.days }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}

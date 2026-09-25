@@ -5,8 +5,9 @@ import { registerCommand, getCommands } from '../core/command.js';
 import type { CommandContext } from '../core/command.js';
 import { Structs } from 'node-napcat-ts';
 import * as api from '../services/officialApi.js';
-import { isAdmin } from '../config.js';
+import { isAdmin, config } from '../config.js';
 import { activityRanking } from '../services/activity.js';
+import { buildSummaryBroadcast } from '../services/payBroadcast.js';
 
 /** 格式化贡献点（两位小数） */
 function fmt(n: number | string | null | undefined): string {
@@ -363,17 +364,22 @@ export function registerAllCommands() {
       const r = await api.payCharge(userId, { title, amount, targets: mentions, openAll });
       if (!r.ok || !r.data) return reply(`创建缴费单失败：${r.error || '官网服务不可用，请稍后再试'}`);
       const d = r.data;
+      // 创建成功后优先用官网 charge-poster 返回的 url 发海报（并取进度用于催缴文案）；
+      // 该接口不可用时退回公开渲染地址，保证「创建成功」这件事始终能发出图/链接。
+      const poster = await resolveChargePoster(d.token);
+      const roster = openAll ? '开放缴纳（不限名单）' : `${poster.count ?? d.targetCount ?? 0} 人`;
       const caption = [
-        `【缴费单已创建】${d.title}`,
-        `金额：${d.amount == null ? '按人填写' : `${fmt(d.amount)} 贡献点/人`} ｜ 名单：${d.targetCount || 0} 人`,
-        `截止：${d.deadline || '—'}`,
+        `【缴费单已创建】${poster.title || d.title}`,
+        `金额：${d.amount == null ? '按人填写' : `${fmt(d.amount)} 贡献点/人`} ｜ 名单：${roster}`,
+        poster.progressLine,
+        `截止：${poster.deadline || d.deadline || '—'}${poster.expired ? '（已截止）' : ''}`,
         d.unmatchedQq?.length
           ? `⚠ 以下 @ 成员未绑定官网账号，已按 QQ 号码登记：${d.unmatchedQq.map((x: any) => x.qq).join('、')}`
           : '',
-        '⚠ 各成员需自己打开链接，在本人登录的官网会话里确认支付。',
-        `网页链接：${d.url}`,
+        '⚠ 名单成员需自己打开链接，在本人登录的官网会话里确认支付（机器人不会代扣）。',
+        `网页链接：${poster.pageUrl}`,
       ].filter(Boolean).join('\n');
-      await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
+      await sendPosterReply(ctx, poster.url, caption, poster.pageUrl);
     },
   );
 
@@ -409,6 +415,94 @@ export function registerAllCommands() {
       await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
     },
   );
+
+  // 缴费单海报图（催缴：按 token/链接重发海报）
+  registerCommand(
+    '缴费单图',
+    ['jiaofeidantu', 'chargeimg', '缴费单海报'],
+    '重发缴费单海报图（催缴）：缴费单图 <token或链接>',
+    async (ctx) => {
+      const token = api.extractPayToken(ctx.text);
+      if (!token) return ctx.reply('用法：#缴费单图 <缴费单链接或 token>\n例如：#缴费单图 https://xuanjian.top/pay/charge/xxxxxxxxxxxxxxxx');
+      const poster = await resolveChargePoster(token);
+      // 官网明确回答「缴费单不存在」时不再发一张必然 404 的图，直接回显官网文案
+      if (poster.missing) {
+        return ctx.reply(`重发海报失败：${poster.error || '缴费单不存在'}\n请确认缴费单链接或 token 是否正确。`);
+      }
+      const caption = [
+        `【缴费单海报】${poster.title || ''}`.trim(),
+        poster.progressLine,
+        poster.deadline ? `截止：${poster.deadline}${poster.expired ? '（已截止）' : ''}` : '',
+        '⚠ 请名单内成员打开链接，在本人登录的官网会话里确认支付（机器人不会代扣）。',
+        `网页链接：${poster.pageUrl}`,
+      ].filter(Boolean).join('\n');
+      await sendPosterReply(ctx, poster.url, caption, poster.pageUrl);
+    },
+  );
+
+  // 待审批列表（管理员查看）
+  registerCommand('审批', ['shenpi', 'approvals', '待审批'], '查看待审批的大额支付（管理员）：审批', async ({ reply }) => {
+    const r = await api.payPendingApprovals();
+    if (!r.ok || !r.data) return reply(`查询待审批失败：${r.error || '官网服务不可用，请稍后再试'}`);
+    const list: any[] = Array.isArray(r.data.approvals) ? r.data.approvals : [];
+    if (!list.length) return reply('当前没有待审批的支付。');
+    const lines = [`【待审批支付 ${list.length} 笔】`];
+    for (const a of list.slice(0, 10)) {
+      lines.push(`#${a.id} ${fmt(a.amount)} 点｜${a.payerName || '—'} → ${a.payeeName || '—'}${a.note ? `｜${a.note}` : ''}`);
+      lines.push(`　通过： #通过 ${a.id}　驳回： #驳回 ${a.id}`);
+    }
+    if (list.length > 10) lines.push(`…另有 ${list.length - 10} 笔未列出。`);
+    const t = r.data.thresholds;
+    if (t) lines.push(`阈值：单笔 ${fmt(t.single)} / 日累计 ${fmt(t.daily)} / 超 ${fmt(t.approval)} 需审批`);
+    lines.push('注：审批按你绑定的官网账号权限判定，非管理员会被拒绝。');
+    reply(lines.join('\n'));
+  });
+
+  // 审批通过 / 驳回（管理员；权限最终由官网按绑定账号判定）
+  const doApprove = async (ctx: CommandContext, action: 'approve' | 'reject') => {
+    const label = action === 'approve' ? '通过' : '驳回';
+    const id = (ctx.text.match(/\d+/) || [])[0];
+    if (!id) return ctx.reply(`用法：#${label} <流水ID>\n先用 #审批 查看待审批列表（形如 #${label} 12）`);
+    const r = await api.payApprove(id, ctx.userId, action);
+    if (!r.ok || !r.data) return ctx.reply(`${label}失败：${r.error || '官网服务不可用，请稍后再试'}`);
+    ctx.reply(r.data.message || `已${label} #${id}`);
+  };
+
+  registerCommand('通过', ['tongguo', 'approve', '同意'], '审批通过一笔大额支付（管理员）：通过 <ID>', (ctx) =>
+    doApprove(ctx, 'approve'),
+  );
+
+  registerCommand('驳回', ['bohui', 'reject', '拒绝'], '驳回一笔大额支付（管理员）：驳回 <ID>', (ctx) =>
+    doApprove(ctx, 'reject'),
+  );
+
+  // 财务月报（管理员）
+  registerCommand('月报', ['yuebao', 'monthly'], '发送本月财务对账海报（管理员）：月报', async (ctx) => {
+    if (!requireAdmin(ctx.userId, ctx.reply)) return;
+    const b = await buildSummaryBroadcast();
+    if (!b.imageUrl) return ctx.reply(`${b.caption}\n（海报图暂不可用，请打开对账后台：${b.fallbackUrl}）`);
+    await sendPosterReply(ctx, b.imageUrl, b.caption, b.fallbackUrl);
+  });
+
+  // 十一服（115）状态：只读查询，官网侧走 Minecraft 状态协议（115 上不部署任何进程）
+  registerCommand('服务器', ['server', '115', '在线状态', '服务器状态'], '查看十一服（115）状态：服务器', async (ctx) => {
+    const r = await api.mcStatus('s115');
+    if (!r.ok || !r.data) return ctx.reply(`查询服务器状态失败：${r.error || '官网服务不可用，请稍后再试'}`);
+    const d = r.data;
+    if (!d.online) {
+      return ctx.reply(`【十一服·历史展览馆】当前无法连接：${d.error || '离线'}\n地址：115.190.153.44:25565`);
+    }
+    const p = d.players || {};
+    const sample = Array.isArray(p.sample) && p.sample.length ? `\n在线：${p.sample.slice(0, 10).join('、')}` : '';
+    ctx.reply(
+      [
+        `【十一服·历史展览馆】${d.version || ''}`,
+        `在线：${p.online ?? 0} / ${p.max ?? '?'} 人${sample}`,
+        d.motd ? `MOTD：${String(d.motd).split('\n')[0]}` : '',
+        `延迟：${d.latencyMs} ms ｜ 地址：115.190.153.44:25565`
+      ].filter(Boolean).join('\n')
+    );
+  });
 }
 
 /** 简单字符串 hash（用于随机种子） */
@@ -418,6 +512,61 @@ function hashNum(s: string): number {
     h = (h * 31 + s.charCodeAt(i)) >>> 0;
   }
   return h;
+}
+
+/* ==================== 缴费单海报辅助 ==================== */
+
+interface ChargePoster {
+  /** 海报图地址（优先官网 charge-poster 返回的 url） */
+  url: string;
+  /** 缴费单网页链接（名单成员在这里确认支付） */
+  pageUrl: string;
+  /** 缴费单标题（官网数据，取不到时用创建返回的标题） */
+  title?: string;
+  /** 截止时间 */
+  deadline?: string;
+  /** 是否已截止 */
+  expired?: boolean;
+  /** 名单人数（charge-poster 的 stats.count） */
+  count?: number;
+  /** 「已缴 x/y 人 ｜ a/b 点」进度行；无 stats 时为空串 */
+  progressLine: string;
+  /** 官网明确返回 404「缴费单不存在」 */
+  missing: boolean;
+  /** 官网错误文案 */
+  error?: string;
+}
+
+/**
+ * 解析缴费单海报（催缴 / 创建后发图共用）：
+ * 1. 先调官网 `GET /api/qqbot/pay/charge-poster?token=`（X-Bot-Token）拿官方 url 与进度统计；
+ * 2. 接口不可用（网络异常 / 5xx）时退回公开渲染地址 `/api/pay/render/charge/<token>.png`，
+ *    保证「发图」这条路径不会因为多调一个接口而整体失败；
+ * 3. 官网明确回答 404（缴费单不存在）时置 `missing`，由调用方决定提示方式。
+ */
+async function resolveChargePoster(token: string): Promise<ChargePoster> {
+  const fallback: ChargePoster = {
+    url: api.payChargePosterUrl(token),
+    pageUrl: api.payChargePageUrl(token),
+    progressLine: '',
+    missing: false,
+  };
+  const r = await api.payChargePosterInfo(token);
+  if (r.status === 404) return { ...fallback, missing: true, error: r.error };
+  if (!r.ok || !r.data?.url) return fallback;
+  const d = r.data;
+  const s = d.stats || null;
+  const count = s ? Number(s.count) || 0 : undefined;
+  return {
+    url: String(d.url),
+    pageUrl: String(d.pageUrl || fallback.pageUrl),
+    title: d.title,
+    deadline: d.deadline,
+    expired: !!d.expired,
+    count,
+    progressLine: s ? `进度：已缴 ${Number(s.paidCount) || 0}/${count} 人 ｜ ${fmt(s.paidSum)}/${fmt(s.total)} 点` : '',
+    missing: false,
+  };
 }
 
 /* ==================== 扫码支付辅助函数 ==================== */
@@ -456,11 +605,11 @@ function parseAmountNote(text: string): { amount?: number; note?: string } {
 }
 
 /**
- * 发送「二维码图片 + 说明文字」（群内回群、私聊回私聊）。
- * 图片发送失败（如 NapCat 拉取图片超时）时退回文字链接，保证信息不丢。
+ * 发送「二维码/海报图片 + 说明文字」（群内回群、私聊回私聊）。
+ * 图片发送失败（如 NapCat 拉取图片超时、签名链接过期）时退回文字链接，保证信息不丢。
  */
-async function sendQrReply(ctx: CommandContext, qrUrl: string, caption: string, fallbackUrl: string): Promise<void> {
-  const message = [Structs.image(qrUrl), Structs.text(`\n${caption}`)];
+async function sendQrReply(ctx: CommandContext, imageUrl: string, caption: string, fallbackUrl: string): Promise<void> {
+  const message = [Structs.image(imageUrl), Structs.text(`\n${caption}`)];
   try {
     if (ctx.groupId) {
       await ctx.client.send('send_group_msg', { group_id: Number(ctx.groupId), message });
@@ -468,6 +617,13 @@ async function sendQrReply(ctx: CommandContext, qrUrl: string, caption: string, 
       await ctx.client.send('send_private_msg', { user_id: Number(ctx.userId), message });
     }
   } catch (e) {
-    ctx.reply(`${caption}\n（二维码图片发送失败，请直接点开链接：${fallbackUrl}）`);
+    ctx.reply(`${caption}\n（图片发送失败，请直接点开链接：${fallbackUrl}）`);
   }
+}
+
+/**
+ * 发送海报图（与二维码同一套收发与降级逻辑，语义化别名，便于缴费单/月报复用）。
+ */
+async function sendPosterReply(ctx: CommandContext, imageUrl: string, caption: string, fallbackUrl: string): Promise<void> {
+  await sendQrReply(ctx, imageUrl, caption, fallbackUrl);
 }

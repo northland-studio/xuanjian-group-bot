@@ -28,7 +28,34 @@ export const config = {
   officialBotToken: process.env.OFFICIAL_BOT_TOKEN || '',
   /** 官网站点根地址（用于生成可扫码的支付链接与二维码图片地址） */
   officialSiteBase: (process.env.OFFICIAL_SITE_BASE || process.env.OFFICIAL_API_BASE || 'https://xuanjian.top').replace(/\/+$/, ''),
+  /** 支付播报总开关：只有 PAY_BROADCAST=on 时才启用待审批轮询与定时播报（缺省 off） */
+  payBroadcast: (process.env.PAY_BROADCAST || '').trim().toLowerCase() === 'on',
+  /**
+   * 播报目标群（财务月报图 + 文字周报都发这里）
+   * 默认主群 860336849；可用 BROADCAST_GROUP_ID 覆盖。
+   */
+  broadcastGroupId: (process.env.BROADCAST_GROUP_ID || '860336849').trim(),
+  /**
+   * 待审批推送群：默认与播报群一致；可用 APPROVAL_GROUP_ID 单独指定（例如只推给管理群）。
+   * 兼容旧变量 ADMIN_GROUP_ID 作为兜底。
+   */
+  approvalGroupId: (
+    process.env.APPROVAL_GROUP_ID ||
+    process.env.BROADCAST_GROUP_ID ||
+    '860336849'
+  ).trim(),
 };
+
+/** 播报群号（数字字符串；配置非法时返回空串，调用方只记日志不发送） */
+export function broadcastGroup(): string {
+  return /^\d+$/.test(config.broadcastGroupId) ? config.broadcastGroupId : '';
+}
+
+/** 待审批推送群号（APPROVAL_GROUP_ID > BROADCAST_GROUP_ID > ADMIN_GROUP_ID > 默认主群） */
+export function approvalGroup(): string {
+  const candidate = config.approvalGroupId || (process.env.ADMIN_GROUP_ID || '').trim();
+  return /^\d+$/.test(candidate) ? candidate : '';
+}
 
 /** 判断某群是否在允许列表（若未配置则放行全部） */
 export function isAllowedGroup(groupId: string | number): boolean {

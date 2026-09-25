@@ -7,6 +7,7 @@ import { config, isAllowedGroup } from './config.js';
 import { parseCommand } from './core/command.js';
 import { registerAllCommands } from './handlers/commands.js';
 import { recordActivity } from './services/activity.js';
+import { startPayBroadcasts } from './services/payBroadcast.js';
 import type { GroupMessage, GroupIncreaseApprove, GroupIncreaseInvite, PrivateFriendMessage, SendMessageSegment } from 'node-napcat-ts';
 
 // ===== 全局错误兜底：记录完整堆栈，避免静默退出 =====
@@ -140,6 +141,12 @@ async function main() {
     }
   }
   console.log(`[bot] 已连接 NapCat（${config.napcat.baseUrl || `${config.napcat.host}:${config.napcat.port}`}）`);
+
+  // ===== 支付播报（待审批轮询 + 月报/周报；PAY_BROADCAST=on 才启用）=====
+  // 发送失败已由服务内部吞掉并降级为日志，这里再兜一层，避免任何异常影响机器人主循环。
+  startPayBroadcasts(async (groupId, message) => {
+    await napcat.send('send_group_msg', { group_id: groupId, message } as any);
+  });
 
   // 保持进程存活：确保事件循环有活跃句柄，避免 main() 返回后进程退出
   // 同时监听 NapCat 连接断开，便于排查
