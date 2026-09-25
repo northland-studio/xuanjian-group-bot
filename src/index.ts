@@ -17,6 +17,24 @@ process.on('unhandledRejection', (e) => {
   console.error('[bot][unhandledRejection]', e);
 });
 
+/**
+ * 把消息段拼成指令解析用的文本。
+ * - 文本段原样拼接（行为与改造前一致）；
+ * - @ 提及转成 `[CQ:at,qq=<QQ>]` 标记，便于「转分 / 缴费单 / 禁言」等需要 @某人的指令取到被提及的 QQ。
+ * 纯文本消息的解析结果不变，不影响既有指令。
+ */
+function buildRawText(message: unknown): string {
+  if (!Array.isArray(message)) return String(message ?? '');
+  return message
+    .map((seg: any) => {
+      const text = seg?.data?.text;
+      if (typeof text === 'string') return text;
+      if (seg?.type === 'at' && seg?.data?.qq) return `[CQ:at,qq=${seg.data.qq}]`;
+      return '';
+    })
+    .join('');
+}
+
 async function main() {
   console.log('[bot] 玄剑公会群机器人启动中...');
 
@@ -41,7 +59,7 @@ async function main() {
       const groupId = String(ctx.group_id);
       if (!isAllowedGroup(groupId)) return;
       const userId = String(ctx.user_id);
-      const raw = Array.isArray(ctx.message) ? ctx.message.map((m) => (m as any).data?.text ?? '').join('') : String(ctx.message);
+      const raw = buildRawText(ctx.message);
       const parsed = parseCommand(raw, false);
       // 记录群活跃（无论是否指令）
       recordActivity(groupId, userId, ctx.sender?.nickname || ctx.sender?.card || '');
@@ -67,7 +85,7 @@ async function main() {
   napcat.on('message.private.friend', async (ctx: PrivateFriendMessage) => {
     try {
       const userId = String(ctx.user_id);
-      const raw = Array.isArray(ctx.message) ? ctx.message.map((m) => (m as any).data?.text ?? '').join('') : String(ctx.message);
+      const raw = buildRawText(ctx.message);
       const parsed = parseCommand(raw, true);
       if (!parsed) return;
       const reply = (msg: string) =>

@@ -2,6 +2,8 @@
  * 群指令实现（查询 + 拓展功能）
  */
 import { registerCommand, getCommands } from '../core/command.js';
+import type { CommandContext } from '../core/command.js';
+import { Structs } from 'node-napcat-ts';
 import * as api from '../services/officialApi.js';
 import { isAdmin } from '../config.js';
 import { activityRanking } from '../services/activity.js';
@@ -300,6 +302,113 @@ export function registerAllCommands() {
     if (r.error) return reply(`提交失败：${r.error}`);
     reply(`✅ 任务完成，${r.reward ?? ''} 贡献点已到账！`);
   });
+
+  // ==================== 贡献点扫码支付 ====================
+  // 设计决策 3：机器人只负责出码与提示，扣款一律回到付款方本人已登录的官网会话确认（不做免密）。
+
+  registerCommand('收款码', ['shoukuanma', 'qr', 'receive', '收款'], '生成我的收款码（90 秒）：收款码 [金额] [备注]', async (ctx) => {
+    const { userId, reply } = ctx;
+    if (!userId) return reply('无法获取你的QQ号，请私聊机器人操作。');
+    const { amount, note } = parseAmountNote(ctx.text);
+    const r = await api.payReceiveCode(userId, amount, note);
+    if (!r.ok || !r.data) return reply(`生成收款码失败：${r.error || '官网服务不可用，请稍后再试'}`);
+    const d = r.data;
+    const caption = [
+      `【收款码】${d.user?.nickname || d.user?.username || userId}`,
+      `金额：${d.amount == null ? '由付款方扫码后填写' : `${fmt(d.amount)} 贡献点`}${d.note ? ` ｜ 备注：${d.note}` : ''}`,
+      `有效期 ${d.ttlSeconds || 90} 秒，过期请重新生成。`,
+      '⚠ 只出码不扣款：请付款方扫码后，在本人登录的官网会话里确认支付（机器人不会代扣）。',
+      `网页链接：${d.url}`,
+    ].join('\n');
+    await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
+  });
+
+  registerCommand('付款码', ['fukuanma', 'paycode', '付款'], '生成我的付款码（60 秒，供收款方反扫）：付款码', async (ctx) => {
+    const { userId, reply } = ctx;
+    if (!userId) return reply('无法获取你的QQ号，请私聊机器人操作。');
+    const r = await api.payPayerCode(userId);
+    if (!r.ok || !r.data) return reply(`生成付款码失败：${r.error || '官网服务不可用，请稍后再试'}`);
+    const d = r.data;
+    const caption = [
+      `【付款码】${d.user?.nickname || d.user?.username || userId}`,
+      `有效期 ${d.remainSeconds ?? d.ttlSeconds ?? 60} 秒（每 ${d.ttlSeconds || 60} 秒刷新一次，过期请重新生成）。`,
+      '使用方式：让收款方在官网「支付中心 → 扫一扫」扫这张图并填写金额。',
+      '⚠ 扫码不等于付款：需要你本人在网页上确认后才会划转。',
+      `网页链接：${d.url}`,
+    ].join('\n');
+    await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
+  });
+
+  registerCommand(
+    '缴费单',
+    ['jiaofeidan', 'charge', '收费'],
+    '创建缴费单（管理员/认证成员）：缴费单 <标题> <金额> [@某人...]',
+    async (ctx) => {
+      const { userId, reply } = ctx;
+      if (!userId) return reply('无法获取你的QQ号，请私聊机器人操作。');
+      const { mentions, rest } = extractMentions(ctx.text);
+      if (!rest) {
+        return reply(
+          '用法：#缴费单 <标题> <金额> [@某人...]\n'
+          + '例如：#缴费单 十一团建费 20 @张三 @李四\n'
+          + '（金额可留空 = 按人各自填写；加「全员」= 开放缴纳，不限名单）',
+        );
+      }
+      const openAll = /(全员|全部|所有人)/.test(rest);
+      const cleaned = rest.replace(/(全员|全部|所有人)/g, ' ').replace(/\s+/g, ' ').trim();
+      const { amount, note } = parseAmountNote(cleaned);
+      const title = (note || cleaned).trim();
+      if (!title) return reply('请填写缴费单标题，例如：#缴费单 十一团建费 20 @张三');
+
+      const r = await api.payCharge(userId, { title, amount, targets: mentions, openAll });
+      if (!r.ok || !r.data) return reply(`创建缴费单失败：${r.error || '官网服务不可用，请稍后再试'}`);
+      const d = r.data;
+      const caption = [
+        `【缴费单已创建】${d.title}`,
+        `金额：${d.amount == null ? '按人填写' : `${fmt(d.amount)} 贡献点/人`} ｜ 名单：${d.targetCount || 0} 人`,
+        `截止：${d.deadline || '—'}`,
+        d.unmatchedQq?.length
+          ? `⚠ 以下 @ 成员未绑定官网账号，已按 QQ 号码登记：${d.unmatchedQq.map((x: any) => x.qq).join('、')}`
+          : '',
+        '⚠ 各成员需自己打开链接，在本人登录的官网会话里确认支付。',
+        `网页链接：${d.url}`,
+      ].filter(Boolean).join('\n');
+      await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
+    },
+  );
+
+  registerCommand(
+    '转分',
+    ['zhuanfen', 'transfer', '付款给'],
+    '付款给某成员（只出码，不扣款）：转分 @某人 <金额> [备注]',
+    async (ctx) => {
+      const { userId, reply } = ctx;
+      const { mentions, rest } = extractMentions(ctx.text);
+      if (!mentions.length) {
+        return reply('用法：#转分 @某人 <金额> [备注]\n例如：#转分 @张三 50 买材料\n（请用 @ 提及收款人）');
+      }
+      const { amount, note } = parseAmountNote(rest);
+      if (amount === undefined) {
+        return reply('请填写转账金额，例如：#转分 @张三 50 买材料');
+      }
+      if (mentions[0] === userId) return reply('不能给自己转分，请 @ 其他成员。');
+
+      // 只出「付给该成员」的收款码，不做任何扣款；对方未绑定时官网会返回明确提示文案
+      const r = await api.payReceiveCode(mentions[0], amount, note);
+      if (!r.ok || !r.data) {
+        return reply(`无法生成收款码：${r.error || '官网服务不可用，请稍后再试'}`);
+      }
+      const d = r.data;
+      const caption = [
+        `【代收码】收款人：${d.user?.nickname || d.user?.username || mentions[0]}（QQ ${mentions[0]}）`,
+        `金额：${fmt(amount)} 贡献点${d.note ? ` ｜ 备注：${d.note}` : ''}`,
+        `有效期 ${d.ttlSeconds || 90} 秒，过期请重新生成。`,
+        '⚠ 机器人只出码、不扣款：请用官网「支付中心 → 扫一扫」扫码，并在本人会话中确认支付。',
+        `网页链接：${d.url}`,
+      ].join('\n');
+      await sendQrReply(ctx, d.qrUrl || api.payQrImageUrl(d.url), caption, d.url);
+    },
+  );
 }
 
 /** 简单字符串 hash（用于随机种子） */
@@ -309,4 +418,56 @@ function hashNum(s: string): number {
     h = (h * 31 + s.charCodeAt(i)) >>> 0;
   }
   return h;
+}
+
+/* ==================== 扫码支付辅助函数 ==================== */
+
+/**
+ * 从指令参数里提取 @ 提及的 QQ。
+ * 提及标记由 index.ts 的 buildRawText 注入（`[CQ:at,qq=<QQ>]`）。
+ * @returns { mentions: 被提及的 QQ 列表, rest: 去掉提及后的剩余文本 }
+ */
+function extractMentions(text: string): { mentions: string[]; rest: string } {
+  const mentions: string[] = [];
+  const rest = String(text || '').replace(/\[CQ:at,qq=(\d{5,12})\]/g, (_m, qq: string) => {
+    mentions.push(qq);
+    return ' ';
+  });
+  return { mentions, rest: rest.replace(/\s+/g, ' ').trim() };
+}
+
+/**
+ * 解析「金额 [备注]」：
+ * 首个形如数字（最多两位小数、大于 0）的 token 视为金额，其余 token 作为备注/标题。
+ */
+function parseAmountNote(text: string): { amount?: number; note?: string } {
+  const tokens = String(text || '').split(/\s+/).filter(Boolean);
+  let amount: number | undefined;
+  const rest: string[] = [];
+  for (const t of tokens) {
+    const n = Number(t);
+    if (amount === undefined && /^\d+(\.\d{1,2})?$/.test(t) && n > 0) {
+      amount = n;
+      continue;
+    }
+    rest.push(t);
+  }
+  return { amount, note: rest.join(' ').trim() || undefined };
+}
+
+/**
+ * 发送「二维码图片 + 说明文字」（群内回群、私聊回私聊）。
+ * 图片发送失败（如 NapCat 拉取图片超时）时退回文字链接，保证信息不丢。
+ */
+async function sendQrReply(ctx: CommandContext, qrUrl: string, caption: string, fallbackUrl: string): Promise<void> {
+  const message = [Structs.image(qrUrl), Structs.text(`\n${caption}`)];
+  try {
+    if (ctx.groupId) {
+      await ctx.client.send('send_group_msg', { group_id: Number(ctx.groupId), message });
+    } else {
+      await ctx.client.send('send_private_msg', { user_id: Number(ctx.userId), message });
+    }
+  } catch (e) {
+    ctx.reply(`${caption}\n（二维码图片发送失败，请直接点开链接：${fallbackUrl}）`);
+  }
 }

@@ -26,6 +26,8 @@ export const config = {
   /** 官网 */
   officialApiBase: process.env.OFFICIAL_API_BASE || 'https://xuanjian.top',
   officialBotToken: process.env.OFFICIAL_BOT_TOKEN || '',
+  /** 官网站点根地址（用于生成可扫码的支付链接与二维码图片地址） */
+  officialSiteBase: (process.env.OFFICIAL_SITE_BASE || process.env.OFFICIAL_API_BASE || 'https://xuanjian.top').replace(/\/+$/, ''),
 };
 
 /** 判断某群是否在允许列表（若未配置则放行全部） */

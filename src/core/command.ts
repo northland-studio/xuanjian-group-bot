@@ -54,9 +54,11 @@ export function getCommands() {
  */
 export function parseCommand(raw: string, isPrivate: boolean): { entry: CommandEntry; args: string } | null {
   const msg = raw.trim();
-  // 群聊需以 # 开头；私聊可带 # 也可不带
-  if (!isPrivate && !msg.startsWith('#')) return null;
-  const body = msg.startsWith('#') ? msg.slice(1) : msg;
+  // 群聊需以 # 或 / 开头；私聊可带前缀也可不带
+  // （历史上只用 #，为兼容 /收款码 这类斜杠写法，两种前缀都接受）
+  const hasPrefix = msg.startsWith('#') || msg.startsWith('/');
+  if (!isPrivate && !hasPrefix) return null;
+  const body = hasPrefix ? msg.slice(1) : msg;
   const trimmed = body.trim();
   if (!trimmed) return null;
   const [head, ...rest] = trimmed.split(/\s+/);

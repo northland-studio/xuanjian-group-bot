@@ -123,3 +123,96 @@ export async function confirmCode(code: string, qq: string) {
 export async function completePlayerTask(taskId: string, code: string, qq: string) {
   return post<any>(`/api/qqbot/task-complete`, { taskId, code, qq });
 }
+
+/* ==================================================================
+ * 贡献点扫码支付（机器人只出码与播报，扣款一律回网页确认 —— 决策 3，不做免密）
+ * 鉴权：沿用 X-Bot-Token（与 /api/qqbot/* 完全一致）
+ * 官网侧实现：routes/qqbot-pay.js（挂载 /api/qqbot/pay）
+ * ================================================================== */
+
+/** 带状态码的响应（需要把官网 4xx 的错误文案原样透传给群成员） */
+export interface PayApiResult<T = any> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+  /** 失败原因（官网 { error } 文案 / 网络错误） */
+  error?: string;
+}
+
+/** 通用请求：保留状态码与官网错误文案 */
+async function requestJson<T = any>(path: string, init: RequestInit = {}): Promise<PayApiResult<T>> {
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...((init.headers as Record<string, string> | undefined) || {}),
+    };
+    if (config.officialBotToken) headers['X-Bot-Token'] = config.officialBotToken;
+
+    const resp = await fetch(`${config.officialApiBase}${path}`, { ...init, headers });
+    let data: any = null;
+    try {
+      data = await resp.json();
+    } catch {
+      data = null;
+    }
+    if (resp.ok) return { ok: true, status: resp.status, data: data as T };
+    return {
+      ok: false,
+      status: resp.status,
+      data: data as T,
+      error: data?.error || `官网接口返回 ${resp.status}`,
+    };
+  } catch {
+    return { ok: false, status: 0, data: null, error: '官网服务不可用，请稍后再试' };
+  }
+}
+
+/** 支付二维码图片地址（官网公开只读接口，机器人直接作为图片发送即可） */
+export function payQrImageUrl(text: string, size = 360): string {
+  return `${config.officialSiteBase}/api/pay/qr.png?text=${encodeURIComponent(text)}&size=${size}`;
+}
+
+/**
+ * 生成收款码（主扫）：代已绑定 QQ 的用户出码，90 秒有效。
+ * 未绑定时 data.error 内含提示文案。
+ */
+export async function payReceiveCode(qq: string, amount?: number | string, note?: string) {
+  return requestJson<any>(`/api/qqbot/pay/receive-code`, {
+    method: 'POST',
+    body: JSON.stringify({ qq, amount, note }),
+  });
+}
+
+/** 生成付款码（反扫）：60 秒有效，由收款方扫码后发起，付款方仍需回网页确认 */
+export async function payPayerCode(qq: string) {
+  return requestJson<any>(`/api/qqbot/pay/payer-code`, {
+    method: 'POST',
+    body: JSON.stringify({ qq }),
+  });
+}
+
+/** 查询本人支付记录（只读） */
+export async function payRecords(qq: string, limit = 20) {
+  return requestJson<any>(`/api/qqbot/pay/records?qq=${encodeURIComponent(qq)}&limit=${limit}`);
+}
+
+/**
+ * 创建缴费单（仅管理员 / 认证成员绑定的账号；权限由官网侧统一校验）
+ * targets 支持 ["123456", { qq, playerName }]
+ */
+export async function payCharge(
+  qq: string,
+  payload: {
+    title: string;
+    amount?: number | string;
+    targets?: Array<string | { qq: string; playerName?: string }>;
+    openAll?: boolean;
+    deadline?: string;
+    note?: string;
+  },
+) {
+  return requestJson<any>(`/api/qqbot/pay/charge`, {
+    method: 'POST',
+    body: JSON.stringify({ qq, ...payload }),
+  });
+}
