@@ -61,11 +61,15 @@ export function parseCommand(raw: string, isPrivate: boolean): { entry: CommandE
   const body = hasPrefix ? msg.slice(1) : msg;
   const trimmed = body.trim();
   if (!trimmed) return null;
-  const [head, ...rest] = trimmed.split(/\s+/);
+  // 只按第一段空白切出指令名，参数原样保留（含换行）——
+  // 「#迎新 设置」这类需要多行文案的指令靠它保留用户输入的换行。
+  const sep = trimmed.search(/\s/);
+  const head = sep === -1 ? trimmed : trimmed.slice(0, sep);
+  const args = sep === -1 ? '' : trimmed.slice(sep).trim();
   const keyword = head.toLowerCase();
   const entry = commands.find(
     (c) => c.name.toLowerCase() === keyword || c.aliases.some((a) => a.toLowerCase() === keyword),
   );
   if (!entry) return null;
-  return { entry, args: rest.join(' ').trim() };
+  return { entry, args };
 }

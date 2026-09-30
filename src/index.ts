@@ -8,6 +8,7 @@ import { parseCommand } from './core/command.js';
 import { registerAllCommands } from './handlers/commands.js';
 import { recordActivity } from './services/activity.js';
 import { startPayBroadcasts } from './services/payBroadcast.js';
+import { buildWelcomeMessageForJoin } from './services/welcome.js';
 import type { GroupMessage, GroupIncreaseApprove, GroupIncreaseInvite, PrivateFriendMessage, SendMessageSegment } from 'node-napcat-ts';
 
 // ===== 全局错误兜底：记录完整堆栈，避免静默退出 =====
@@ -34,6 +35,24 @@ function buildRawText(message: unknown): string {
       return '';
     })
     .join('');
+}
+
+/**
+ * 入群欢迎：按本群配置组装并发送迎新词。
+ * - 群名/人数/昵称取不到时相关变量留空，不影响发送；
+ * - 未开启迎新（新指令 #迎新 开关 off）时直接返回，不发消息；
+ * - 所有异常只记日志，绝不抛出（不影响机器人主循环）。
+ */
+async function sendWelcome(napcat: NCWebsocket, groupId: string, userId: string): Promise<void> {
+  try {
+    const client = (method: string, params: Record<string, unknown>) => napcat.send(method as any, params as any);
+    const msg = await buildWelcomeMessageForJoin({ groupId, userId, client });
+    if (!msg) return;
+    await napcat.send('send_group_msg', { group_id: Number(groupId), message: msg.segments } as any);
+    console.log(`[迎新] 已向群 ${groupId} 发送迎新词（@新人：${msg.mentioned ? '是' : '否'}）`);
+  } catch (e) {
+    console.error('[迎新] 发送失败:', (e as Error)?.message || e);
+  }
 }
 
 async function main() {
@@ -105,19 +124,16 @@ async function main() {
     }
   });
 
-  // ===== 入群欢迎 =====
+  // ===== 入群欢迎（文案按群配置，见 services/welcome.ts 与 #迎新 系列管理指令）=====
   napcat.on('notice.group_increase', (ctx: GroupIncreaseApprove | GroupIncreaseInvite) => {
     try {
       const groupId = String(ctx.group_id);
       if (!isAllowedGroup(groupId)) return;
-      napcat
-        .send('send_group_msg', {
-          group_id: ctx.group_id,
-          message: [Structs.text(`欢迎新成员加入玄剑公会！\n输入 #帮助 查看机器人指令。`)] as SendMessageSegment[],
-        })
-        .catch(() => {});
+      const userId = String(ctx.user_id);
+      // 取群信息/昵称会多两次 API 调用，放到异步里做，且失败全部降级为日志
+      void sendWelcome(napcat, groupId, userId);
     } catch (e) {
-      /* 忽略 */
+      console.error('[迎新] 事件处理失败:', (e as Error)?.message || e);
     }
   });
 

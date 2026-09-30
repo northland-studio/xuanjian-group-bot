@@ -287,3 +287,34 @@ export async function payApprove(id: number | string, qq: string, action: 'appro
 export async function mcStatus(server = 's115') {
   return requestJson<any>(`/api/mc/status?server=${encodeURIComponent(server)}`);
 }
+
+/* ==================================================================
+ * 指令帮助图（#help 图片输出）
+ * 官网侧：POST /api/qqbot/help-card（X-Bot-Token）
+ * 请求体：{ title, subtitle, groups: [{ name, items: [{ name, aliases, desc }] }] }
+ * 返回：{ ok:true, url:"https://xuanjian.top/api/render/help/<hash>.png", hash, count, expiresIn }
+ * 约束（超限官网返回 400 + { error }）：groups ≤12 组、每组 items ≤40 条、
+ * name ≤12 字、desc ≤40 字、整体 JSON ≤200KB。
+ * 图片地址是公开只读的（内容就是指令帮助，无敏感信息），机器人直接当图片发送即可。
+ * ================================================================== */
+
+/** 帮助图请求体（与官网契约一致） */
+export interface HelpCardPayload {
+  title: string;
+  subtitle: string;
+  groups: Array<{
+    name: string;
+    items: Array<{ name: string; aliases: string[]; desc: string }>;
+  }>;
+}
+
+/**
+ * 生成（或复用官网同 hash 的）指令帮助图。
+ * 返回 { ok, data: { url, hash, count, expiresIn }, error }；失败文案沿用官网 4xx 的 { error }。
+ */
+export async function postHelpCard(payload: HelpCardPayload) {
+  return requestJson<any>(`/api/qqbot/help-card`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}

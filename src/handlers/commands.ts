@@ -8,6 +8,19 @@ import * as api from '../services/officialApi.js';
 import { isAdmin, config } from '../config.js';
 import { activityRanking } from '../services/activity.js';
 import { buildSummaryBroadcast } from '../services/payBroadcast.js';
+import { getHelpCard, helpCardCaption } from '../services/helpCard.js';
+import {
+  DEFAULT_WELCOME_TEXT,
+  MAX_WELCOME_TEXT_LENGTH,
+  WELCOME_VARIABLES,
+  buildWelcomeMessage,
+  getWelcomeConfig,
+  resetWelcomeText,
+  setWelcomeEnabled,
+  setWelcomeMention,
+  setWelcomeText,
+  welcomeTextOf,
+} from '../services/welcome.js';
 
 /** 格式化贡献点（两位小数） */
 function fmt(n: number | string | null | undefined): string {
@@ -29,14 +42,30 @@ function requireAdmin(qq: string, reply: (s: string) => void): boolean {
 }
 
 export function registerAllCommands() {
-  // 帮助
-  registerCommand('help', ['帮助', '菜单'], '查看指令列表', ({ reply }) => {
-    const lines = ['玄剑公会群机器人指令：'];
-    for (const c of getCommands()) {
-      lines.push(`#${c.name} — ${c.desc}`);
+  // 帮助：优先发官网生成的指令总览图；官网/发图任一失败都退回原来的文字列表。
+  // `#help 刷新`（或 `#指令图`）跳过缓存强制重新生成。
+  const sendHelpCard = async (ctx: CommandContext, force: boolean) => {
+    try {
+      const card = await getHelpCard(force);
+      if (card.ok && card.url) {
+        const sentOk = await trySendImageReply(ctx, card.url, helpCardCaption(card.count));
+        if (sentOk) return;
+      }
+    } catch (e) {
+      // 兜底：帮助这条路必须永远有回应，任何异常都降级成文字列表
+      console.error('[help] 帮助图失败，回退文字列表:', (e as Error)?.message || e);
     }
-    lines.push('注：查询/核销等敏感操作请私聊机器人。');
-    reply(lines.join('\n'));
+    ctx.reply(helpText());
+  };
+
+  registerCommand('help', ['帮助', '菜单'], '查看指令列表（图片）', async (ctx) => {
+    const force = /^(刷新|refresh|reload|update|-f)$/i.test(ctx.text.trim());
+    await sendHelpCard(ctx, force);
+  });
+
+  // 指令图：等价于「#help 刷新」，指令有增删后用它立刻更新帮助图
+  registerCommand('指令图', ['helpimg', 'helpimage'], '重新生成指令帮助图：#指令图', async (ctx) => {
+    await sendHelpCard(ctx, true);
   });
 
   // 档案查询
@@ -503,6 +532,48 @@ export function registerAllCommands() {
       ].filter(Boolean).join('\n')
     );
   });
+
+  // ==================== 迎新词（管理员；按群保存） ====================
+  // `迎新` 用子指令（查看/设置/开关/@/测试/重置）；另外 3 个常用动作各注册一条独立指令，
+  // 便于群里直接用 #欢迎查看 / #设置迎新 / #迎新开关 触发（避免在群里打两个词）。
+  registerCommand('迎新', ['yingxin', '迎新词'], '迎新词设置（管理员）：迎新 查看/设置/开关/测试/重置', async (ctx) => {
+    if (!requireAdmin(ctx.userId, ctx.reply)) return;
+    const raw = ctx.text.trim();
+    if (!raw) return void ctx.reply(WELCOME_USAGE);
+    if (/^(查看|查看迎新|查看迎新词|view|show)$/i.test(raw)) return void welcomeView(ctx);
+    if (/^(重置|reset)$/i.test(raw)) return void welcomeReset(ctx);
+    const set = raw.match(/^(?:设置|set)\s*([\s\S]*)$/);
+    if (set) {
+      if (!set[1].trim()) return void ctx.reply('用法：#迎新 设置 <文本>（≤500 字，支持 {换行}）');
+      return void welcomeSet(ctx, set[1]);
+    }
+    const sw = raw.match(/^(?:开关|switch)\s*([\s\S]*)$/i);
+    if (sw) return void welcomeSwitch(ctx, sw[1]);
+    const at = raw.match(/^(?:@|提及|at)\s*([\s\S]*)$/i);
+    if (at) return void welcomeMention(ctx, at[1]);
+    const test = raw.match(/^(?:测试|test)\s*([\s\S]*)$/i);
+    if (test) return void welcomeTest(ctx, test[1].trim());
+    ctx.reply(`未知的迎新子指令「${raw.split(/\s+/)[0]}」\n\n${WELCOME_USAGE}`);
+  });
+
+  // 别名指令：迎新 查看
+  registerCommand('欢迎查看', [], '查看本群迎新词与开关状态（管理员）', async (ctx) => {
+    if (!requireAdmin(ctx.userId, ctx.reply)) return;
+    welcomeView(ctx);
+  });
+
+  // 别名指令：迎新 设置
+  registerCommand('设置迎新', [], '设置本群迎新词（管理员）：设置迎新 <文本>', async (ctx) => {
+    if (!requireAdmin(ctx.userId, ctx.reply)) return;
+    if (!ctx.text.trim()) return void ctx.reply('用法：设置迎新 <文本>（≤500 字，支持 {换行}）');
+    welcomeSet(ctx, ctx.text);
+  });
+
+  // 别名指令：迎新 开关
+  registerCommand('迎新开关', [], '开启/关闭本群迎新词（管理员）：迎新开关 on|off', async (ctx) => {
+    if (!requireAdmin(ctx.userId, ctx.reply)) return;
+    welcomeSwitch(ctx, ctx.text);
+  });
 }
 
 /** 简单字符串 hash（用于随机种子） */
@@ -512,6 +583,142 @@ function hashNum(s: string): number {
     h = (h * 31 + s.charCodeAt(i)) >>> 0;
   }
   return h;
+}
+
+/* ==================== 帮助（图片失败时的文字回退） ==================== */
+
+/**
+ * 原文字版指令列表（帮助图不可用时的回退，格式与改造前完全一致）。
+ * 指令清单同样来自 getCommands()，不硬编码。
+ */
+function helpText(): string {
+  const lines = ['玄剑公会群机器人指令：'];
+  for (const c of getCommands()) {
+    lines.push(`#${c.name} — ${c.desc}`);
+  }
+  lines.push('注：查询/核销等敏感操作请私聊机器人。');
+  return lines.join('\n');
+}
+
+/* ==================== 迎新词（管理指令实现） ==================== */
+
+const WELCOME_USAGE = [
+  '迎新词设置（仅管理员）：',
+  '#迎新 查看 —— 查看本群开关状态与迎新词',
+  '#迎新 设置 <文本> —— 保存迎新词（≤500 字，支持 {换行}）',
+  '#迎新 开关 on|off —— 开启/关闭入群欢迎',
+  '#迎新 @ on|off —— 是否 @ 新人',
+  '#迎新 测试 [文本] —— 立即发一条测试（不 @ 真实新人）',
+  '#迎新 重置 —— 清空自定义，回到默认文案',
+  `模板变量：${WELCOME_VARIABLES}`,
+].join('\n');
+
+/** 长文案分片发送（查看/回显用，避免单条消息过长被风控） */
+const WELCOME_CHUNK_SIZE = 350;
+
+function replyChunks(ctx: CommandContext, text: string, size = WELCOME_CHUNK_SIZE): void {
+  let buf = '';
+  const flush = () => {
+    if (buf) {
+      ctx.reply(buf);
+      buf = '';
+    }
+  };
+  for (const line of String(text ?? '').split('\n')) {
+    let rest = line;
+    while (rest.length > size) {
+      flush();
+      ctx.reply(rest.slice(0, size));
+      rest = rest.slice(size);
+    }
+    if (buf && buf.length + rest.length + 1 > size) flush();
+    buf = buf ? `${buf}\n${rest}` : rest;
+  }
+  flush();
+}
+
+/** 解析 on/off（兼容 开/关、true/false、1/0、yes/no） */
+function parseOnOff(raw: string): boolean | null {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (/^(on|开|开启|启用|true|1|是|yes)$/.test(s)) return true;
+  if (/^(off|关|关闭|禁用|false|0|否|no)$/.test(s)) return false;
+  return null;
+}
+
+/** 群上下文校验（迎新词按群保存，私聊不知道存哪个群） */
+function requireGroup(ctx: CommandContext): string | null {
+  if (ctx.groupId) return ctx.groupId;
+  ctx.reply('迎新词按群保存，请在群内使用该指令。');
+  return null;
+}
+
+/** 迎新 查看：开关状态 + 当前文案（很长时分片） */
+function welcomeView(ctx: CommandContext): void {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  const cfg = getWelcomeConfig(groupId);
+  const text = welcomeTextOf(cfg);
+  const head = [
+    '【本群迎新词】',
+    `状态：${cfg.enabled ? '已开启' : '已关闭'} ｜ @新人：${cfg.mention ? '是' : '否'}`,
+    `文案：${cfg.text ? '自定义' : '默认'}（${Array.from(text).length} 字 / 上限 ${MAX_WELCOME_TEXT_LENGTH}）`,
+    cfg.updatedAt ? `更新：${cfg.updatedAt.slice(0, 16).replace('T', ' ')}${cfg.updatedBy ? ` by ${cfg.updatedBy}` : ''}` : '',
+    '—— 当前文案 ——',
+  ].filter(Boolean).join('\n');
+  replyChunks(ctx, `${head}\n${text}\n—— 模板变量 ——\n${WELCOME_VARIABLES}\n提示：#迎新 测试 可预览效果。`);
+}
+
+/** 迎新 设置：保存本群迎新词（>500 字拒绝） */
+function welcomeSet(ctx: CommandContext, raw: string): void {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  const r = setWelcomeText(groupId, raw, ctx.userId);
+  if (!r.ok) return void ctx.reply(r.error || '保存失败，请稍后再试。');
+  ctx.reply(
+    `✅ 已保存本群迎新词（${r.length} 字 / 上限 ${MAX_WELCOME_TEXT_LENGTH}）。\n`
+    + '发送 #迎新 测试 可预览效果，#迎新 查看 可查看当前配置。',
+  );
+}
+
+/** 迎新 开关：开启/关闭入群欢迎 */
+function welcomeSwitch(ctx: CommandContext, raw: string): void {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  const on = parseOnOff(raw);
+  if (on === null) return void ctx.reply('用法：#迎新 开关 on|off（别名 #迎新开关）');
+  setWelcomeEnabled(groupId, on, ctx.userId);
+  ctx.reply(`入群迎新词已${on ? '开启' : '关闭'}（本群）。`);
+}
+
+/** 迎新 @：{at} 是否变成真实 @ */
+function welcomeMention(ctx: CommandContext, raw: string): void {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  const on = parseOnOff(raw);
+  if (on === null) return void ctx.reply('用法：#迎新 @ on|off（控制 {at} 是否变成真实 @新人）');
+  setWelcomeMention(groupId, on, ctx.userId);
+  ctx.reply(`本群迎新词${on ? '会' : '不会'} @ 新人。`);
+}
+
+/** 迎新 测试：按当前配置在群里发一条（标明「测试」，不 @ 真实新人） */
+async function welcomeTest(ctx: CommandContext, override: string): Promise<void> {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  const msg = buildWelcomeMessage({ groupId, userId: ctx.userId, test: true, textOverride: override });
+  if (!msg) return void ctx.reply('迎新词构建失败，请检查文案。');
+  try {
+    await ctx.client.send('send_group_msg', { group_id: Number(groupId), message: msg.segments });
+  } catch (e) {
+    ctx.reply('测试消息发送失败，请稍后再试。');
+  }
+}
+
+/** 迎新 重置：清空自定义文案（开关与 @ 设置保留） */
+function welcomeReset(ctx: CommandContext): void {
+  const groupId = requireGroup(ctx);
+  if (!groupId) return;
+  resetWelcomeText(groupId, ctx.userId);
+  ctx.reply(`已清空本群自定义迎新词，回到默认文案：\n${DEFAULT_WELCOME_TEXT}`);
 }
 
 /* ==================== 缴费单海报辅助 ==================== */
@@ -605,10 +812,10 @@ function parseAmountNote(text: string): { amount?: number; note?: string } {
 }
 
 /**
- * 发送「二维码/海报图片 + 说明文字」（群内回群、私聊回私聊）。
- * 图片发送失败（如 NapCat 拉取图片超时、签名链接过期）时退回文字链接，保证信息不丢。
+ * 发送「图片 + 说明文字」（群内回群、私聊回私聊）。
+ * @returns 发送是否成功（调用方据此决定是否降级成文字/链接）
  */
-async function sendQrReply(ctx: CommandContext, imageUrl: string, caption: string, fallbackUrl: string): Promise<void> {
+async function trySendImageReply(ctx: CommandContext, imageUrl: string, caption: string): Promise<boolean> {
   const message = [Structs.image(imageUrl), Structs.text(`\n${caption}`)];
   try {
     if (ctx.groupId) {
@@ -616,9 +823,19 @@ async function sendQrReply(ctx: CommandContext, imageUrl: string, caption: strin
     } else {
       await ctx.client.send('send_private_msg', { user_id: Number(ctx.userId), message });
     }
+    return true;
   } catch (e) {
-    ctx.reply(`${caption}\n（图片发送失败，请直接点开链接：${fallbackUrl}）`);
+    return false;
   }
+}
+
+/**
+ * 发送「二维码/海报图片 + 说明文字」（群内回群、私聊回私聊）。
+ * 图片发送失败（如 NapCat 拉取图片超时、签名链接过期）时退回文字链接，保证信息不丢。
+ */
+async function sendQrReply(ctx: CommandContext, imageUrl: string, caption: string, fallbackUrl: string): Promise<void> {
+  const ok = await trySendImageReply(ctx, imageUrl, caption);
+  if (!ok) ctx.reply(`${caption}\n（图片发送失败，请直接点开链接：${fallbackUrl}）`);
 }
 
 /**

@@ -1,13 +1,18 @@
 /**
- * 机器人支付指令 + 播报服务干跑（不发真实消息、不碰生产数据）
+ * 机器人干跑脚本（不发真实消息、不碰生产数据）
  * 用法：cd xuanjian-group-bot && npm run build && node scripts/dryrun-pay.mjs
  *
  * 覆盖：
- *  - 指令注册/别名、请求 URL、X-Bot-Token 鉴权头、群内发图调用、回复文案
+ *  - 指令注册/别名去重、请求 URL、X-Bot-Token 鉴权头、群内发图调用、回复文案
  *  - 缴费单改发 charge-poster 海报图（含进度/催缴文案与故障降级）、缴费单图（token/链接/不存在）
  *  - 审批 / 通过 / 驳回（含官网 403/409/404 文案回显）、月报（签名链接）
  *  - 播报服务：待审批轮询去重（游标持久化 + 重启不重复）、失败静默退避、月报/周报内容组装、定时任务到点只触发一次
  *  - 开关：PAY_BROADCAST 缺省 off（子进程探针验证不建定时器、不请求官网）
+ *  - #help 图片输出：官网 help-card 请求 URL/鉴权头/body 结构（分组上限与指令清单来自注册表）、
+ *    发图调用与短文案、进程内+落盘缓存、#help 刷新 / #指令图 强制重生成、
+ *    官网故障与发图失败时的文字列表回退、/help 与 help/帮助/菜单 兼容
+ *  - 迎新词：#迎新 查看/设置/开关/@/测试/重置（含别名指令）的权限与存储行为、
+ *    超长拒绝、每群一份配置、模板变量替换与降级、入群事件消息组装（关闭时不发）
  * 注意：生产 ctx.text 是 parseCommand 之后的「参数部分」（不含指令名），这里保持一致。
  */
 process.env.OFFICIAL_API_BASE = 'https://xuanjian.top';
@@ -30,6 +35,9 @@ const BOT_ROOT = path.join(__dirname, '..');
 const STATE_FILE = path.join(BOT_ROOT, 'data', 'pay-broadcast.json');
 const ACTIVITY_FILE = path.join(BOT_ROOT, 'data', 'activity.json');
 const ACTIVITY_BACKUP = path.join(BOT_ROOT, 'data', 'activity.json.dryrun-bak');
+const HELP_CACHE_FILE = path.join(BOT_ROOT, 'data', 'help-card.json');
+const WELCOME_FILE = path.join(BOT_ROOT, 'data', 'welcome.json');
+const WELCOME_BACKUP = path.join(BOT_ROOT, 'data', 'welcome.json.dryrun-bak');
 
 const ADMIN_QQ = '1365146774';
 const GROUP_ID = '860336849';
@@ -52,6 +60,12 @@ const mock = {
     approveFail: null,
     /** charge-poster 对这些 token 返回 404「缴费单不存在」 */
     missingPosterTokens: ['MissingPosterToken0001'],
+    /** help-card：非 null 时直接返回该错误（模拟官网 400/500） */
+    helpCardFail: null,
+    /** help-card 成功次数（每次生成不同 hash/url，用来验证刷新确实重新生成） */
+    helpCardSeq: 0,
+    /** help-card 返回的 expiresIn（null = 官网不设有效期） */
+    helpCardExpiresIn: null,
 };
 
 function jsonResponse(payload, status = 200) {
@@ -85,6 +99,23 @@ globalThis.fetch = async (url, init = {}) => {
     }
     if (u.includes('/api/qqbot/pay/render-url')) {
         return jsonResponse({ ok: true, url: 'https://xuanjian.top/api/pay/render/summary.png?exp=1790000000&sig=abc123', expiresIn: 600 });
+    }
+    // 指令帮助图：每次成功都换一个 hash/url，便于断言「缓存复用」与「刷新重生」
+    if (u.includes('/api/qqbot/help-card')) {
+        if (mock.helpCardFail) return jsonResponse(mock.helpCardFail.body, mock.helpCardFail.status);
+        mock.helpCardSeq += 1;
+        const hash = `hash${mock.helpCardSeq}`;
+        let count = 0;
+        try {
+            count = (JSON.parse(rec.body || '{}').groups || []).reduce((n, g) => n + (g.items?.length || 0), 0);
+        } catch { /* body 不是 JSON 时按 0 记 */ }
+        return jsonResponse({
+            ok: true,
+            url: `https://xuanjian.top/api/render/help/${hash}.png`,
+            hash,
+            count,
+            expiresIn: mock.helpCardExpiresIn,
+        });
     }
     // 注意：必须排在 /api/qqbot/pay/charge 之前（前缀相同）
     if (u.includes('/api/qqbot/pay/charge-poster')) {
@@ -192,22 +223,31 @@ const check = (name, cond, extra = '') => {
 };
 
 const { registerAllCommands } = await import('../dist/handlers/commands.js');
-const { getCommands } = await import('../dist/core/command.js');
+const { getCommands, parseCommand } = await import('../dist/core/command.js');
 const broadcast = await import('../dist/services/payBroadcast.js');
+const helpCard = await import('../dist/services/helpCard.js');
+const welcome = await import('../dist/services/welcome.js');
 
-// 备份/清空本地状态，避免干跑污染真实游标与活跃数据
+// 备份/清空本地状态，避免干跑污染真实游标、活跃数据、帮助图缓存与迎新词配置
 let activityBackup = null;
 if (fs.existsSync(ACTIVITY_FILE)) {
     activityBackup = fs.readFileSync(ACTIVITY_FILE, 'utf8');
     fs.copyFileSync(ACTIVITY_FILE, ACTIVITY_BACKUP);
 }
 if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+let welcomeBackup = null;
+if (fs.existsSync(WELCOME_FILE)) {
+    welcomeBackup = fs.readFileSync(WELCOME_FILE, 'utf8');
+    fs.copyFileSync(WELCOME_FILE, WELCOME_BACKUP);
+    fs.unlinkSync(WELCOME_FILE);
+}
+if (fs.existsSync(HELP_CACHE_FILE)) fs.unlinkSync(HELP_CACHE_FILE);
 
 registerAllCommands();
 const entries = getCommands();
 console.log(`已注册指令 ${entries.length} 条`);
 
-// 新指令不得与既有指令（原 26 条）重名：主名与别名都不能重复
+// 新增指令不得与既有指令重名：主名与别名都不能重复
 {
     const seen = new Map();
     const dup = [];
@@ -222,6 +262,13 @@ console.log(`已注册指令 ${entries.length} 条`);
     for (const n of ['缴费单', '缴费单图', '审批', '通过', '驳回', '月报']) {
         check(`新指令 ${n} 已注册`, entries.some((e) => e.name === n));
     }
+    for (const n of ['help', '指令图', '迎新', '欢迎查看', '设置迎新', '迎新开关']) {
+        check(`新指令 ${n} 已注册`, entries.some((e) => e.name === n));
+    }
+    const helpAliases = entries.find((e) => e.name === 'help')?.aliases || [];
+    for (const n of ['帮助', '菜单']) {
+        check(`help 兼容别名 ${n} 保留`, helpAliases.includes(n));
+    }
 }
 
 const find = (...names) => entries.find((e) => {
@@ -229,7 +276,7 @@ const find = (...names) => entries.find((e) => {
     return names.some((n) => cands.includes(n.toLowerCase()));
 });
 
-async function run(entry, { userId = ADMIN_QQ, groupId = GROUP_ID, text = '' } = {}) {
+async function run(entry, { userId = ADMIN_QQ, groupId = GROUP_ID, text = '', clientSendThrows = false } = {}) {
     const replies = [];
     const sent = [];
     const baseline = calls.length;
@@ -237,7 +284,12 @@ async function run(entry, { userId = ADMIN_QQ, groupId = GROUP_ID, text = '' } =
         userId, groupId, text,
         isPrivate: !groupId,
         reply: (m) => replies.push(String(m)),
-        client: { send: async (action, params) => { sent.push({ action, params }); } },
+        client: {
+            send: async (action, params) => {
+                if (clientSendThrows) throw new Error('napcat send failed');
+                sent.push({ action, params });
+            },
+        },
     };
     await entry.handler(ctx);
     const apiCalls = calls.slice(baseline);
@@ -246,7 +298,7 @@ async function run(entry, { userId = ADMIN_QQ, groupId = GROUP_ID, text = '' } =
     const sentText = segments.filter((seg) => seg?.type === 'text').map((seg) => String(seg.data?.text || ''));
     // 文案可能走 reply（错误/提示）也可能作为图片消息的文字段（成功路径）
     const allText = [...replies, ...sentText].join(' | ');
-    return { replies, sent, apiCalls, images, text: allText };
+    return { replies, sent, segments, apiCalls, images, text: allText };
 }
 
 /* ==================== ① 指令干跑 ==================== */
@@ -500,12 +552,377 @@ console.log('\n=== 开关与边界 ===');
     check('缴费单缺参数时给用法', /用法|例如|请填写/.test(c.text), c.text.replace(/\s+/g, ' ').slice(0, 56));
 }
 
+/* ==================== ④ #help 图片输出 ==================== */
+
+console.log('\n=== ④ #help 图片输出 ===');
+{
+    const helpEntry = find('help');
+    check('help 已注册且保留原别名 帮助/菜单', !!helpEntry, (helpEntry?.aliases || []).join('/'));
+    check('指令图 已注册（等价 #help 刷新）', !!find('指令图', 'helpimg'));
+
+    // 前缀兼容：# 、/ 、私聊不带前缀
+    check('/help 前缀兼容', parseCommand('/help', false)?.entry?.name === 'help');
+    check('#help 前缀兼容', parseCommand('#help', false)?.entry?.name === 'help');
+    check('#help 刷新 参数解析', parseCommand('#help 刷新', false)?.args === '刷新');
+    check('群聊无前缀不触发（保持原行为）', parseCommand('help', false) === null);
+    check('私聊不带前缀可用 help', parseCommand('帮助', true)?.entry?.name === 'help');
+
+    const r1 = await run(helpEntry, { text: '' });
+    const call = r1.apiCalls.find((c) => c.url.includes('/api/qqbot/help-card'));
+    check('help 调 POST /api/qqbot/help-card', !!call && call.method === 'POST', call ? call.url.replace('https://xuanjian.top', '') : '未发起请求');
+    check('help 带 X-Bot-Token', !!call && !!call.auth);
+
+    const body = call ? JSON.parse(call.body || '{}') : {};
+    check('help 请求体 title', body.title === '玄剑公会群机器人 · 指令总览', String(body.title));
+    check(
+        'help 请求体 subtitle 含条数与前缀',
+        body.subtitle === `共 ${entries.length} 条指令 · 前缀 # 或 /`,
+        String(body.subtitle),
+    );
+    check(
+        'help 请求体 groups ≤12 组、每组 items ≤40 条',
+        Array.isArray(body.groups) && body.groups.length > 0 && body.groups.length <= 12
+        && body.groups.every((g) => Array.isArray(g.items) && g.items.length > 0 && g.items.length <= 40),
+        `${body.groups?.length} 组 / 最多 ${Math.max(...(body.groups || [{ items: [] }]).map((g) => g.items.length))} 条`,
+    );
+    check(
+        'help 请求体 name ≤12 字、desc ≤40 字',
+        body.groups.every((g) => [...g.name].length <= 12
+            && g.items.every((it) => [...String(it.name)].length <= 12 && [...String(it.desc)].length <= 40)),
+    );
+    check(
+        'help 请求体 items 含 name/aliases/desc',
+        body.groups.every((g) => g.items.every((it) => typeof it.name === 'string' && Array.isArray(it.aliases) && typeof it.desc === 'string')),
+    );
+    check('help 请求体含别名（如 帮助/菜单）', body.groups.some((g) => g.items.some((it) => it.name === 'help' && it.aliases.includes('帮助') && it.aliases.includes('菜单'))));
+    check('help 请求体 ≤200KB', Buffer.byteLength(call?.body || '') <= 200 * 1024, `${Buffer.byteLength(call?.body || '')} 字节`);
+
+    const itemNames = body.groups.flatMap((g) => g.items.map((it) => it.name));
+    check(
+        'help 指令清单来自 getCommands()（不硬编码）',
+        itemNames.length === entries.length && entries.every((e) => itemNames.includes(e.name)),
+        `图上 ${itemNames.length} 条 / 注册表 ${entries.length} 条`,
+    );
+
+    check('help 群内发图 send_group_msg', r1.sent.some((s) => s.action === 'send_group_msg'));
+    check('help 图片地址 = 官网返回的 url', r1.images.some((u) => String(u) === 'https://xuanjian.top/api/render/help/hash1.png'), String(r1.images[0] || '无'));
+    check(
+        'help 短文案「共 N 条指令，前缀 # 或 /」',
+        new RegExp(`共 ${entries.length} 条指令，前缀 # 或 /`).test(r1.text),
+        r1.text.replace(/\s+/g, ' ').slice(0, 60),
+    );
+
+    // 缓存：同一份指令清单不再请求官网，directly 复用 url
+    const r2 = await run(helpEntry, { text: '' });
+    check('help 第二次命中缓存（0 次官网请求）', r2.apiCalls.length === 0 && r2.images.some((u) => String(u).includes('hash1.png')), `${r2.apiCalls.length} 次请求`);
+    check(
+        'help 缓存落盘 data/help-card.json（含 url + hash）',
+        fs.existsSync(HELP_CACHE_FILE) && /"hash":\s*"hash1"/.test(fs.readFileSync(HELP_CACHE_FILE, 'utf8')),
+        fs.existsSync(HELP_CACHE_FILE) ? fs.readFileSync(HELP_CACHE_FILE, 'utf8').replace(/\s+/g, ' ').slice(0, 70) : '无缓存文件',
+    );
+
+    // 刷新：强制重新生成（官网换 hash/url）
+    mock.helpCardExpiresIn = 600;
+    const r3 = await run(helpEntry, { text: '刷新' });
+    check(
+        'help 刷新 强制重新生成',
+        r3.apiCalls.some((c) => c.url.includes('/api/qqbot/help-card')) && r3.images.some((u) => String(u).includes('hash2.png')),
+        String(r3.images[0] || '无'),
+    );
+    check('help expiresIn 落盘为 expiresAt', /"expiresAt":\s*\d+/.test(fs.readFileSync(HELP_CACHE_FILE, 'utf8')));
+    const r4 = await run(find('指令图'), { text: '' });
+    check(
+        '#指令图 = 强制刷新',
+        r4.apiCalls.some((c) => c.url.includes('/api/qqbot/help-card')) && r4.images.some((u) => String(u).includes('hash3.png')),
+        String(r4.images[0] || '无'),
+    );
+    check('help 刷新后再次缓存命中', (await run(helpEntry, { text: '' })).apiCalls.length === 0);
+    mock.helpCardExpiresIn = null;
+
+    // 刷新失败但旧图还在 → 继续用旧图（比回退文字更好），且不抛异常
+    mock.helpCardFail = { status: 500, body: { error: '渲染服务不可用' } };
+    const stale = await run(helpEntry, { text: '刷新' });
+    check(
+        'help 官网 500 + 有缓存 → 仍发旧图（不降级文字）',
+        stale.apiCalls.length === 1 && stale.images.some((u) => String(u).includes('hash3.png')),
+        String(stale.images[0] || '无'),
+    );
+
+    // 官网故障 + 无缓存 → 回退原文字列表（格式与改造前一致）
+    helpCard.clearHelpCardCache();
+    if (fs.existsSync(HELP_CACHE_FILE)) fs.unlinkSync(HELP_CACHE_FILE);
+    const fallback = await run(helpEntry, { text: '' });
+    check(
+        'help 官网故障且无缓存 → 回退文字列表',
+        fallback.images.length === 0
+        && /玄剑公会群机器人指令：/.test(fallback.text)
+        && /注：查询\/核销等敏感操作请私聊机器人。/.test(fallback.text),
+        fallback.text.replace(/\s+/g, ' ').slice(0, 60),
+    );
+    check(
+        'help 回退文字含全部指令（#名称 — 描述）',
+        entries.every((e) => fallback.text.includes(`#${e.name} — `)),
+        `${entries.length} 条`,
+    );
+    check('help 回退时不发图（sends 为空）', fallback.sent.length === 0);
+    mock.helpCardFail = null;
+
+    // 官网正常但 NapCat 发图失败 → 同样回退文字
+    const imgFail = await run(helpEntry, { text: '', clientSendThrows: true });
+    check(
+        'help 发图失败 → 回退文字列表',
+        imgFail.images.length === 0 && /玄剑公会群机器人指令：/.test(imgFail.text),
+        imgFail.text.slice(0, 40),
+    );
+
+    // 分组规则：稳定、可读，抽样命中预期分组
+    const groupsA = helpCard.buildHelpCardGroups();
+    const groupsB = helpCard.buildHelpCardGroups();
+    check('help 分组稳定（两次构建完全一致）', JSON.stringify(groupsA) === JSON.stringify(groupsB));
+    const groupOf = (name) => groupsA.find((g) => g.items.some((it) => it.name === name))?.name;
+    check('help 分组抽样：help/指令图 → 帮助与菜单', groupOf('help') === '帮助与菜单' && groupOf('指令图') === '帮助与菜单', String(groupOf('help')));
+    check('help 分组抽样：档案/查自己 → 成员与档案', groupOf('档案') === '成员与档案' && groupOf('查自己') === '成员与档案');
+    check('help 分组抽样：收款码/缴费单/审批 → 支付与缴费', groupOf('收款码') === '支付与缴费' && groupOf('缴费单') === '支付与缴费' && groupOf('审批') === '支付与缴费');
+    check('help 分组抽样：迎新/迎新开关 → 群管理', groupOf('迎新') === '群管理' && groupOf('迎新开关') === '群管理');
+    check('help 分组抽样：核销/任务码 → 核销与任务', groupOf('核销') === '核销与任务' && groupOf('任务码') === '核销与任务');
+    check(
+        'help 分组可读（组数 ≥5、组名 ≤12 字、无空组）',
+        groupsA.length >= 5 && groupsA.every((g) => [...g.name].length <= 12 && g.items.length > 0),
+        groupsA.map((g) => `${g.name}(${g.items.length})`).join(' '),
+    );
+}
+
+/* ==================== ⑤ 迎新词（管理指令） ==================== */
+
+console.log('\n=== ⑤ 迎新词 ===');
+{
+    const welcomeEntry = find('迎新', 'yingxin', '迎新词');
+    const viewEntry = find('欢迎查看');
+    const setEntry = find('设置迎新');
+    const switchEntry = find('迎新开关');
+    check('迎新 指令族已注册（迎新/欢迎查看/设置迎新/迎新开关）', !!welcomeEntry && !!viewEntry && !!setEntry && !!switchEntry);
+    check(
+        '迎新 别名可用（yingxin/迎新词）',
+        parseCommand('#迎新词 查看', false)?.entry?.name === '迎新' && parseCommand('#yingxin 查看', false)?.entry?.name === '迎新',
+    );
+
+    // 默认配置
+    {
+        const def = welcome.getWelcomeConfig(GROUP_ID);
+        check('迎新 默认：开启 + @新人 + 无自定义文案', def.enabled === true && def.mention === true && def.text === undefined);
+        check(
+            '迎新 默认文案为纯文本（无 <b> 等无效标签、含换行）',
+            !/<\/?[a-zA-Z][^>]*>/.test(welcome.DEFAULT_WELCOME_TEXT) && welcome.DEFAULT_WELCOME_TEXT.includes('\n'),
+            JSON.stringify(welcome.DEFAULT_WELCOME_TEXT).slice(0, 70),
+        );
+    }
+
+    // 权限：全部子指令 / 别名指令都只能管理员用
+    {
+        const before = fs.existsSync(WELCOME_FILE) ? fs.readFileSync(WELCOME_FILE, 'utf8') : null;
+        const cases = [
+            ['迎新 查看', welcomeEntry, '查看'],
+            ['迎新 设置', welcomeEntry, '设置 你好'],
+            ['迎新 开关', welcomeEntry, '开关 off'],
+            ['迎新 测试', welcomeEntry, '测试'],
+            ['迎新 重置', welcomeEntry, '重置'],
+            ['欢迎查看', viewEntry, ''],
+            ['设置迎新', setEntry, '你好'],
+            ['迎新开关', switchEntry, 'on'],
+        ];
+        for (const [label, entry, text] of cases) {
+            const r = await run(entry, { text, userId: '10000001' });
+            check(`迎新 非管理员「${label}」被拒且不发消息`, /权限不足/.test(r.text) && r.sent.length === 0, r.text.slice(0, 18));
+        }
+        const after = fs.existsSync(WELCOME_FILE) ? fs.readFileSync(WELCOME_FILE, 'utf8') : null;
+        check('迎新 非管理员操作未写盘', after === before);
+    }
+
+    // 设置 / 存储结构
+    {
+        const r = await run(welcomeEntry, { text: '设置 欢迎{at}加入！{换行}第二行' });
+        check('迎新 设置 成功并回显字数', /已保存本群迎新词（\d+ 字/.test(r.text), r.text.replace(/\s+/g, ' ').slice(0, 50));
+        const store = JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8'));
+        const g = store.groups[GROUP_ID];
+        check('迎新 存储结构：每群一份 {enabled, mention, text}', !!g && g.enabled === true && g.mention === true && typeof g.text === 'string', JSON.stringify(store.groups && Object.keys(store.groups)));
+        check('迎新 存储文案原样保存（变量不展开）', g.text === '欢迎{at}加入！{换行}第二行');
+        check('迎新 存储记录更新人/时间', g.updatedBy === ADMIN_QQ && !!g.updatedAt);
+
+        // 多种换行写法：真实换行、字面 \n
+        await run(welcomeEntry, { text: '设置 第一行\n第二行' });
+        check('迎新 设置 保留真实换行（多行文本）', JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text === '第一行\n第二行');
+        await run(setEntry, { text: '甲\\n乙' });
+        check('迎新 设置 支持字面 \\n（别名指令 设置迎新）', JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text === '甲\n乙');
+        check('指令解析保留多行参数（迎新多行文案）', parseCommand('#迎新 设置 第一行\n第二行', false)?.args === '设置 第一行\n第二行');
+    }
+
+    // 查看（含超长分片）
+    {
+        const longText = '长'.repeat(400);
+        await run(welcomeEntry, { text: `设置 ${longText}` });
+        const r = await run(welcomeEntry, { text: '查看' });
+        check(
+            '迎新 查看 显示状态/@/文案来源/变量表',
+            /状态：已开启/.test(r.text) && /@新人：是/.test(r.text) && /文案：自定义（400 字 \/ 上限 500）/.test(r.text) && /\{at\} \{昵称\} \{群名\} \{人数\} \{时间\} \{换行\}/.test(r.text),
+            r.text.replace(/\s+/g, ' ').slice(0, 80),
+        );
+        check('迎新 查看 很长时分片发送', r.replies.length >= 2, `${r.replies.length} 条`);
+        const byAlias = await run(viewEntry, { text: '' });
+        check('迎新 查看 别名指令可用', /状态：/.test(byAlias.text) && /文案：自定义/.test(byAlias.text));
+    }
+
+    // 超长拒绝
+    {
+        const before = JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text;
+        const r = await run(welcomeEntry, { text: `设置 ${'超'.repeat(501)}` });
+        check('迎新 设置 >500 字被拒绝并提示', /501 字/.test(r.text) && /最多 500 字/.test(r.text), r.text.slice(0, 46));
+        check('迎新 超长被拒后不改写存储', JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text === before);
+        const empty = await run(welcomeEntry, { text: '设置 ' });
+        check('迎新 设置空文本被拒并给用法', /不能为空|用法/.test(empty.text), empty.text.slice(0, 30));
+    }
+
+    // 开关 / @
+    {
+        const off = await run(welcomeEntry, { text: '开关 off' });
+        check('迎新 开关 off 落库', welcome.getWelcomeConfig(GROUP_ID).enabled === false && /已关闭/.test(off.text), off.text.slice(0, 20));
+        const on = await run(switchEntry, { text: 'on' });
+        check('迎新开关（别名指令）on 落库', welcome.getWelcomeConfig(GROUP_ID).enabled === true && /已开启/.test(on.text));
+        const bad = await run(welcomeEntry, { text: '开关 也许' });
+        check('迎新 开关 参数非法给用法', /用法/.test(bad.text), bad.text.slice(0, 30));
+        const mOff = await run(welcomeEntry, { text: '@ off' });
+        check('迎新 @ off 落库（mention=false）', welcome.getWelcomeConfig(GROUP_ID).mention === false && /不会 @ 新人/.test(mOff.text), mOff.text.slice(0, 24));
+        await run(welcomeEntry, { text: '@ on' });
+        check('迎新 @ on 落库', welcome.getWelcomeConfig(GROUP_ID).mention === true);
+    }
+
+    // 测试
+    {
+        const r = await run(welcomeEntry, { text: '测试' });
+        check(
+            '迎新 测试 在群里发一条并标明「测试」',
+            r.sent.some((s) => s.action === 'send_group_msg') && /【测试】/.test(r.text) && /未真实 @ 新人/.test(r.text),
+            r.text.replace(/\s+/g, ' ').slice(0, 50),
+        );
+        check('迎新 测试 不 @ 真实新人（无 at 段）', !r.segments.some((s) => s.type === 'at'), r.segments.map((s) => s.type).join(','));
+        const custom = await run(welcomeEntry, { text: '测试 临时文案 {at}{昵称}' });
+        check('迎新 测试 [文本] 用临时文案且不落库', /临时文案/.test(custom.text) && JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text !== '临时文案 {at}{昵称}');
+        await run(welcomeEntry, { text: '开关 off' });
+        check('迎新 关闭状态下仍可测试预览', /【测试】/.test((await run(welcomeEntry, { text: '测试' })).text));
+        await run(welcomeEntry, { text: '开关 on' });
+    }
+
+    // 重置
+    {
+        const r = await run(welcomeEntry, { text: '重置' });
+        const cfg = welcome.getWelcomeConfig(GROUP_ID);
+        check('迎新 重置 清空自定义回到默认', cfg.text === undefined && /默认文案/.test(r.text), r.text.replace(/\s+/g, ' ').slice(0, 40));
+        check('迎新 重置 保留开关与 @ 设置', cfg.enabled === true && cfg.mention === true);
+        check('迎新 重置后存储不再有 text 字段', JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8')).groups[GROUP_ID].text === undefined);
+    }
+
+    // 每群一份配置
+    {
+        await run(welcomeEntry, { text: '设置 群A专属文案', groupId: GROUP_ID });
+        const other = await run(welcomeEntry, { text: '查看', groupId: '999888777' });
+        check('迎新 每群一份配置（B 群不受 A 群影响）', /文案：默认/.test(other.text) && !/群A专属文案/.test(other.text), other.text.replace(/\s+/g, ' ').slice(0, 40));
+        const store = JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8'));
+        check('迎新 存储中两群各自独立', store.groups[GROUP_ID].text === '群A专属文案' && store.groups['999888777'] === undefined);
+        await run(welcomeEntry, { text: '重置' });
+    }
+
+    // 模板变量（纯函数）
+    {
+        const rendered = welcome.renderWelcomeText('{昵称}|{群名}|{人数}', { qq: '12345', nickname: '小明', groupName: '玄剑', memberCount: 42 });
+        check('迎新 变量 {昵称}/{群名}/{人数} 替换', rendered === '小明|玄剑|42', rendered);
+        const timed = welcome.renderWelcomeText('{时间}', {});
+        check('迎新 变量 {时间} 为上海时间格式', /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(timed), timed);
+        check('迎新 变量 {换行} 变真实换行', welcome.renderWelcomeText('甲{换行}乙', {}) === '甲\n乙');
+        check('迎新 未知变量原样保留（便于发现拼写错误）', welcome.renderWelcomeText('{未知}', {}) === '{未知}');
+        check('迎新 取不到昵称时用 QQ 兜底', /QQ 12345/.test(welcome.buildWelcomeSegments('欢迎 {昵称}', { qq: '12345' }, { mention: false }).text));
+
+        const on = welcome.buildWelcomeSegments('欢迎{at}加入', { qq: '22334455', nickname: '新人甲' }, { mention: true });
+        check(
+            '迎新 {at} 生成真实 at 消息段',
+            on.mentioned === true && on.segments.some((s) => s.type === 'at' && String(s.data.qq) === '22334455'),
+            on.text.replace(/\n/g, ' '),
+        );
+        const off = welcome.buildWelcomeSegments('欢迎{at}加入', { qq: '22334455' }, { mention: false });
+        check(
+            '迎新 mention=false 时不 @（{at} 被删掉）',
+            !off.segments.some((s) => s.type === 'at') && off.text === '欢迎加入',
+            JSON.stringify(off.text),
+        );
+        check('迎新 渲染后无残留变量', !/\{(at|昵称|群名|人数|时间|换行)\}/.test(on.text + off.text));
+    }
+
+    // 入群事件：组装 + 关闭时不发 + NapCat 取信息失败时降级
+    {
+        await run(welcomeEntry, { text: '设置 欢迎{at}{昵称}｜{群名} {人数} 人' });
+        const napcatCalls = [];
+        const client = async (method, params) => {
+            napcatCalls.push(method);
+            if (method === 'get_group_info') return { group_name: '玄剑公会主群', member_count: 321 };
+            if (method === 'get_group_member_info') return { card: '新人甲', nickname: '新人甲' };
+            return {};
+        };
+        const msg = await welcome.buildWelcomeMessageForJoin({ groupId: GROUP_ID, userId: '22334455', client });
+        check(
+            '迎新 入群：渲染 @新人 + 昵称/群名/人数',
+            !!msg && msg.mentioned === true && msg.text.includes('@22334455') && msg.text.includes('新人甲')
+            && msg.text.includes('玄剑公会主群') && msg.text.includes('321 人'),
+            (msg?.text || '').replace(/\n/g, ' '),
+        );
+        check('迎新 入群：消息段为 at + text', !!msg && msg.segments.some((s) => s.type === 'at') && msg.segments.some((s) => s.type === 'text'));
+        check('迎新 入群：会取群信息与新人昵称', napcatCalls.includes('get_group_info') && napcatCalls.includes('get_group_member_info'), napcatCalls.join(','));
+
+        // NapCat 挂了：降级为空变量，不抛异常
+        const flaky = async () => { throw new Error('napcat down'); };
+        const degraded = await welcome.buildWelcomeMessageForJoin({ groupId: GROUP_ID, userId: '22334455', client: flaky });
+        check('迎新 入群：NapCat 故障时降级（不抛异常）', !!degraded && degraded.text.includes('欢迎'), (degraded?.text || '').replace(/\n/g, ' '));
+
+        await run(welcomeEntry, { text: '开关 off' });
+        const offMsg = await welcome.buildWelcomeMessageForJoin({ groupId: GROUP_ID, userId: '22334455', client });
+        check('迎新 入群：本群关闭时不发消息', offMsg === null);
+        await run(welcomeEntry, { text: '重置' });
+    }
+
+    // 用法 / 未知子指令 / 私聊
+    {
+        const usage = await run(welcomeEntry, { text: '' });
+        check(
+            '迎新 无参数给完整用法',
+            ['#迎新 查看', '#迎新 设置', '#迎新 开关', '#迎新 测试', '#迎新 重置'].every((s) => usage.text.includes(s)),
+            usage.text.replace(/\s+/g, ' ').slice(0, 50),
+        );
+        const unknown = await run(welcomeEntry, { text: '乱写' });
+        check('迎新 未知子指令给用法而不是当文案存下', /未知的迎新子指令/.test(unknown.text) && unknown.sent.length === 0);
+        const priv = await run(welcomeEntry, { text: '查看', groupId: '' });
+        check('迎新 私聊时提示「按群保存」', /按群保存/.test(priv.text), priv.text.slice(0, 30));
+    }
+
+    // 存储损坏容错（写坏 JSON 后仍能读默认值、指令不崩）
+    {
+        const saved = fs.existsSync(WELCOME_FILE) ? fs.readFileSync(WELCOME_FILE, 'utf8') : null;
+        fs.writeFileSync(WELCOME_FILE, '{ 这不是合法 JSON', 'utf8');
+        const cfg = welcome.getWelcomeConfig(GROUP_ID);
+        check('迎新 存储损坏时容错（回默认值、不抛异常）', cfg.enabled === true && cfg.mention === true && cfg.text === undefined);
+        const r = await run(welcomeEntry, { text: '查看' });
+        check('迎新 存储损坏时指令仍可用', /状态：已开启/.test(r.text));
+        if (saved !== null) fs.writeFileSync(WELCOME_FILE, saved, 'utf8');
+        else if (fs.existsSync(WELCOME_FILE)) fs.unlinkSync(WELCOME_FILE);
+    }
+}
+
 /* ==================== 清理本地状态 ==================== */
 
 if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+if (fs.existsSync(HELP_CACHE_FILE)) fs.unlinkSync(HELP_CACHE_FILE);
 if (activityBackup !== null) fs.writeFileSync(ACTIVITY_FILE, activityBackup, 'utf8');
 if (fs.existsSync(ACTIVITY_BACKUP)) fs.unlinkSync(ACTIVITY_BACKUP);
-console.log('\n（已清理干跑产生的 data/pay-broadcast.json 与临时备份）');
+if (welcomeBackup !== null) fs.writeFileSync(WELCOME_FILE, welcomeBackup, 'utf8');
+else if (fs.existsSync(WELCOME_FILE)) fs.unlinkSync(WELCOME_FILE);
+if (fs.existsSync(WELCOME_BACKUP)) fs.unlinkSync(WELCOME_BACKUP);
+console.log('\n（已清理干跑产生的 data/pay-broadcast.json、data/help-card.json、data/welcome.json 与临时备份）');
 
 console.log(`\n=== 结果：通过 ${pass} / 失败 ${fail} ===\n`);
 process.exit(fail ? 1 : 0);
