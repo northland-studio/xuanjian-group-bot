@@ -76,9 +76,28 @@ src/
 data/                     # 运行时数据（本地 JSON，自动创建）
 ├── activity.json         # 群活跃统计
 ├── pay-broadcast.json    # 播报游标
-├── help-card.json        # 帮助图缓存（url/hash/有效期）
+├── help-card.json        # 帮助图缓存（url/hash/有效期/本地图片路径）
+├── help-cards/           # 帮助图图片本体（<hash>.png，最多保留 5 张）
 └── welcome.json          # 每群迎新词配置
 ```
+
+## #help 帮助图（本地图片优先）
+
+`#help`（别名：`帮助`/`菜单`）会发一张汇总全部指令的图片，流程是：
+
+1. 按指令注册表本地分组 → `POST 官网 /api/qqbot/pay/help-card`（带 `X-Bot-Token`）；
+2. 官网按内容 hash 渲染 PNG 并返回公开地址；
+3. 机器人把 PNG **下载到本地** `data/help-cards/<hash>.png`，之后一律发**本地文件**（`file://` 绝对路径），
+   不再让 NapCat 每次去官网拉图；
+4. 图片下载失败 → 退回发官网在线地址；官网整个不可用 → 退回原文字列表（三级降级，`#help` 永远有回应）。
+
+- 缓存：指令清单签名没变就直接复用（`data/help-card.json`）；本地图片被删会自动补下，不必重新生成。
+- 强制刷新：`#help 刷新` 或 `#指令图`（指令增删后用）。
+- 部署后预热（可选，避免群里第一条 `#help` 现拉）：`npm run build && node scripts/prewarm-help.mjs`。
+- 干跑自测：`npm run build && node scripts/dryrun-pay.mjs`（不发真实消息，覆盖缓存/降级/路径等 200+ 断言）。
+
+> 注意：官网接口路径是 `/api/qqbot/**pay**/help-card`（挂在 `routes/qqbot-pay.js`）。
+> 漏掉 `/pay` 会 404，且因为降级到文字列表而不易察觉 —— 干跑脚本里有断言专门盯这条路径。
 
 ## 环境变量（.env）
 

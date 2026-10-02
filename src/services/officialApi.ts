@@ -290,7 +290,8 @@ export async function mcStatus(server = 's115') {
 
 /* ==================================================================
  * 指令帮助图（#help 图片输出）
- * 官网侧：POST /api/qqbot/help-card（X-Bot-Token）
+ * 官网侧：POST /api/qqbot/pay/help-card（X-Bot-Token）—— 线上挂在 routes/qqbot-pay.js 的 /help-card，
+ * 完整路径带 /pay（曾误写成 /api/qqbot/help-card 导致生产 404 一直退回文字列表，勿改）
  * 请求体：{ title, subtitle, groups: [{ name, items: [{ name, aliases, desc }] }] }
  * 返回：{ ok:true, url:"https://xuanjian.top/api/render/help/<hash>.png", hash, count, expiresIn }
  * 约束（超限官网返回 400 + { error }）：groups ≤12 组、每组 items ≤40 条、
@@ -313,7 +314,7 @@ export interface HelpCardPayload {
  * 返回 { ok, data: { url, hash, count, expiresIn }, error }；失败文案沿用官网 4xx 的 { error }。
  */
 export async function postHelpCard(payload: HelpCardPayload) {
-  return requestJson<any>(`/api/qqbot/help-card`, {
+  return requestJson<any>(`/api/qqbot/pay/help-card`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });

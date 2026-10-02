@@ -1,19 +1,24 @@
 /**
  * 指令帮助图（#help 图片输出）
  *
- * 流程：getCommands() 取全部指令与别名 → 本地按功能分组 → POST 官网 /api/qqbot/help-card
- *      → 拿公开只读的 png 地址发图；官网不可用时由调用方回退文字列表。
+ * 流程：getCommands() 取全部指令与别名 → 本地按功能分组 → POST 官网 /api/qqbot/pay/help-card
+ *      → 把官网渲染好的 png **下载到本地** data/help-cards/<hash>.png → 之后 #help 直接发本地文件，
+ *        不再每次都让 NapCat 去拉 online 地址；下载失败则退回发在线地址，官网全挂时由调用方回退文字列表。
  *
  * 分组是「规则匹配」而不是硬编码指令清单：新增指令只要名字/描述命中规则就会自动归组，
  * 没有命中的落到「其它指令」。规则顺序固定 → 分组结果稳定（同样的指令清单必然得到同一张图，
  * 官网按内容算 hash，命中缓存时不会重复渲染）。
  *
- * 缓存：进程内 + data/help-card.json（含指令清单签名）。指令清单没变且图片没过期就直接复用；
- * `#help 刷新` 会跳过缓存重新生成。
+ * 缓存两级：
+ *   1) data/help-card.json —— 指令清单签名 + 图片地址/hash（清单没变且图片没过期就不请求官网）；
+ *   2) data/help-cards/<hash>.png —— 图片本体，本地文件在就发本地文件。
+ * `#help 刷新` 会跳过缓存重新生成（重新 POST + 重新下载）。
  */
+import fs from 'fs';
+import path from 'path';
 import { getCommands } from '../core/command.js';
 import * as api from './officialApi.js';
-import { read, write } from './store.js';
+import { read, write, dataDir } from './store.js';
 
 /** 帮助图标题（官网按它画头部） */
 export const HELP_CARD_TITLE = '玄剑公会群机器人 · 指令总览';
@@ -28,6 +33,13 @@ const MAX_DESC = 40;
 
 /** 缓存文件（存 data/help-card.json） */
 const CACHE_FILE = 'help-card';
+
+/** 图片本体目录（data/help-cards/），文件名 = 官网按内容算的 hash */
+const IMAGE_SUBDIR = 'help-cards';
+/** 本地最多保留几张历史图（hash 变了就写新文件，旧的清掉，避免越堆越多） */
+const IMAGE_KEEP = 5;
+/** 下载超时：官网首次渲染可能要一两秒，超时就直接发在线地址 */
+const DOWNLOAD_TIMEOUT_MS = 20000;
 
 export interface HelpCardItem {
   name: string;
@@ -147,6 +159,90 @@ export function helpCardCaption(count: number): string {
   return `共 ${count} 条指令，${HELP_CARD_PREFIX}（发送 #help 刷新 可重新生成）`;
 }
 
+/* ==================== 图片本体（发本地文件才不依赖官网在线） ==================== */
+
+/** 图片文件名：优先用官网内容 hash，缺 hash 时退化成 url 文件名；只留安全字符防路径穿越 */
+function imageKey(hash: string | undefined, url: string): string {
+  let fromUrl = '';
+  try {
+    fromUrl = path.basename(new URL(url).pathname).replace(/\.png$/i, '');
+  } catch {
+    fromUrl = '';
+  }
+  const raw = String(hash || fromUrl || 'help').replace(/[^A-Za-z0-9._-]/g, '');
+  return raw || 'help';
+}
+
+function imageDirPath(): string {
+  return path.join(dataDir(), IMAGE_SUBDIR);
+}
+
+function imagePathOf(key: string): string {
+  return path.join(imageDirPath(), `${key}.png`);
+}
+
+/** 本地图可用性：存在且 >8 字节（PNG magic 就是 8 字节，小于它必然是坏文件） */
+function localImageOk(file: string | null | undefined): file is string {
+  try {
+    return !!file && fs.statSync(file).size > 8;
+  } catch {
+    return false;
+  }
+}
+
+/** 只保留最近 IMAGE_KEEP 张历史图（含当前这张） */
+function pruneImages(keepFile: string): void {
+  try {
+    const dir = imageDirPath();
+    const others = fs
+      .readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith('.png'))
+      .map((f) => path.join(dir, f))
+      .filter((f) => f !== keepFile)
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    for (const f of others.slice(Math.max(0, IMAGE_KEEP - 1))) fs.unlinkSync(f);
+  } catch {
+    /* 清理失败不影响发图 */
+  }
+}
+
+/**
+ * 确保本地有这张图：命中就复用，没有就下载一次（原子写：先写 .tmp 再 rename）。
+ * 任何失败都返回 null —— 调用方会退回「发在线地址」，不影响出图。
+ */
+async function ensureLocalImage(url: string, hash?: string, cachedPath?: string | null): Promise<string | null> {
+  if (localImageOk(cachedPath)) return cachedPath;
+
+  const dest = imagePathOf(imageKey(hash, url));
+  if (localImageOk(dest)) return dest;
+
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    // magic 校验：别把官网的错误页/HTML 当图片存进本地缓存
+    const isPng = buf.length > 100 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    if (!isPng) throw new Error(`不是有效 PNG（${buf.length} 字节）`);
+
+    fs.mkdirSync(imageDirPath(), { recursive: true });
+    const tmp = `${dest}.tmp`;
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, dest);
+    pruneImages(dest);
+    console.log(`[help] 帮助图已下载到本地：${dest}（${(buf.length / 1024).toFixed(1)}KB）`);
+    return dest;
+  } catch (e) {
+    console.error('[help] 帮助图本地缓存失败，改发在线地址:', (e as Error)?.message || e);
+    return null;
+  }
+}
+
+/** 当前本地帮助图路径（存在时返回；运维/脚本排查用） */
+export function localHelpImagePath(): string | null {
+  const c = memory || loadCache();
+  return c && localImageOk(c.localPath) ? c.localPath : null;
+}
+
 /* ==================== 缓存 ==================== */
 
 interface HelpCardCache {
@@ -154,6 +250,8 @@ interface HelpCardCache {
   signature: string;
   url: string;
   hash?: string;
+  /** 本地图片绝对路径（null = 当时没下载成功） */
+  localPath?: string | null;
   count: number;
   /** 过期时间戳；null = 官网没给有效期（永久） */
   expiresAt: number | null;
@@ -162,9 +260,11 @@ interface HelpCardCache {
 
 export interface HelpCardResult {
   ok: boolean;
-  /** 图片地址（公开只读） */
+  /** 图片地址（公开只读，作为本地文件不可用时的兜底） */
   url?: string;
   hash?: string;
+  /** 本地图片绝对路径（已下载成功时才返回；调用方优先发这个） */
+  localPath?: string;
   /** 官网返回的指令条数（缺省用本地条数） */
   count: number;
   /** 是否直接用了缓存（没有请求官网） */
@@ -189,8 +289,26 @@ function loadCache(): HelpCardCache | null {
   return c;
 }
 
+/** 命中缓存时的统一出口：顺手确保本地有图（首次升级/本地被删都会自动补下） */
+async function resultFromCache(cached: HelpCardCache, extra: Partial<HelpCardResult> = {}): Promise<HelpCardResult> {
+  const localPath = await ensureLocalImage(cached.url, cached.hash, cached.localPath);
+  if (localPath !== cached.localPath) {
+    cached.localPath = localPath;
+    write(CACHE_FILE, cached);
+  }
+  return {
+    ok: true,
+    url: cached.url,
+    hash: cached.hash,
+    count: cached.count,
+    cached: true,
+    localPath: localPath || undefined,
+    ...extra,
+  };
+}
+
 /**
- * 取帮助图地址。
+ * 取帮助图（本地文件优先，在线地址兜底）。
  * @param force 跳过缓存强制重新生成（`#help 刷新`）
  */
 export async function getHelpCard(force = false): Promise<HelpCardResult> {
@@ -202,7 +320,7 @@ export async function getHelpCard(force = false): Promise<HelpCardResult> {
     const cached = usable(memory, signature) ? memory : loadCache();
     if (usable(cached, signature)) {
       memory = cached;
-      return { ok: true, url: cached.url, hash: cached.hash, count: cached.count, cached: true };
+      return resultFromCache(cached);
     }
   }
 
@@ -213,7 +331,7 @@ export async function getHelpCard(force = false): Promise<HelpCardResult> {
     const cached = memory || loadCache();
     if (usable(cached, signature)) {
       memory = cached;
-      return { ok: true, url: cached.url, hash: cached.hash, count: cached.count, cached: true, stale: true };
+      return resultFromCache(cached, { stale: true });
     }
     return { ok: false, count, error: r.error || '官网服务不可用，请稍后再试' };
   }
@@ -223,14 +341,24 @@ export async function getHelpCard(force = false): Promise<HelpCardResult> {
     signature,
     url,
     hash: r.data?.hash ? String(r.data.hash) : undefined,
+    localPath: null,
     count: Number(r.data?.count) || count,
     // 官网给秒数时提前 5 秒失效，避免发出刚好过期的签名图；null/0 视为永久
     expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 - 5000 : null,
     savedAt: new Date().toISOString(),
   };
+  // 生成成功就把图片本体一起落到本地：之后 #help 直接发本地文件，不再依赖官网在线
+  entry.localPath = await ensureLocalImage(entry.url, entry.hash);
   memory = entry;
   write(CACHE_FILE, entry);
-  return { ok: true, url: entry.url, hash: entry.hash, count: entry.count, cached: false };
+  return {
+    ok: true,
+    url: entry.url,
+    hash: entry.hash,
+    count: entry.count,
+    cached: false,
+    localPath: entry.localPath || undefined,
+  };
 }
 
 /** 清空帮助图缓存（干跑/排查用） */

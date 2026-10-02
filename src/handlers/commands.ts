@@ -4,6 +4,7 @@
 import { registerCommand, getCommands } from '../core/command.js';
 import type { CommandContext } from '../core/command.js';
 import { Structs } from 'node-napcat-ts';
+import { pathToFileURL } from 'url';
 import * as api from '../services/officialApi.js';
 import { isAdmin, config } from '../config.js';
 import { activityRanking } from '../services/activity.js';
@@ -47,9 +48,13 @@ export function registerAllCommands() {
   const sendHelpCard = async (ctx: CommandContext, force: boolean) => {
     try {
       const card = await getHelpCard(force);
-      if (card.ok && card.url) {
-        const sentOk = await trySendImageReply(ctx, card.url, helpCardCaption(card.count));
-        if (sentOk) return;
+      if (card.ok) {
+        const caption = helpCardCaption(card.count);
+        // 优先发本地文件：图已经在机器人服务器上（data/help-cards/），不用让 NapCat 再去官网拉一次
+        const local = card.localPath ? pathToFileURL(card.localPath).href : '';
+        if (local && (await trySendImageReply(ctx, local, caption))) return;
+        // 本地不可用或发本地失败（如 NapCat 读不到该路径）→ 再用在线地址兜一次
+        if (card.url && (await trySendImageReply(ctx, card.url, caption))) return;
       }
     } catch (e) {
       // 兜底：帮助这条路必须永远有回应，任何异常都降级成文字列表

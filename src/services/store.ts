@@ -40,6 +40,12 @@ export function write<T>(name: string, data: T): void {
   }
 }
 
+/** 数据目录绝对路径（不存在时自动创建）：二进制缓存（如帮助图）也放这里 */
+export function dataDir(): string {
+  ensureDir();
+  return DATA_DIR;
+}
+
 /** 简单取当天日期 YYYY-MM-DD */
 export function todayStr(offsetDays = 0): string {
   const d = new Date();
