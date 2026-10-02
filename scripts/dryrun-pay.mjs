@@ -9,7 +9,7 @@
  *  - 播报服务：待审批轮询去重（游标持久化 + 重启不重复）、失败静默退避、月报/周报内容组装、定时任务到点只触发一次
  *  - 开关：PAY_BROADCAST 缺省 off（子进程探针验证不建定时器、不请求官网）
  *  - #help 图片输出：官网 help-card 请求 URL/鉴权头/body 结构（分组上限与指令清单来自注册表）、
- *    图片本体下载到本地 data/help-cards/ 并发本地文件（下载失败退回在线地址）、
+ *    图片本体下载到本地 data/help-cards/ 并发 base64:// 内联本地图（下载失败退回在线地址）、
  *    进程内+落盘缓存、本地图丢失自动补下、#help 刷新 / #指令图 强制重生成、
  *    官网故障与发图失败时的文字列表回退、/help 与 help/帮助/菜单 兼容
  *  - 迎新词：#迎新 查看/设置/开关/@/测试/重置（含别名指令）的权限与存储行为、
@@ -84,10 +84,11 @@ function jsonResponse(payload, status = 200) {
     };
 }
 
-/** 假的 PNG 响应（带 PNG magic，够大以通过机器人的有效性校验） */
-function pngResponse(bytes = 4096) {
-    const buf = Buffer.alloc(bytes, 0);
+/** 假的 PNG 响应（带 PNG magic，够大以通过机器人的有效性校验；把 hash 写进内容便于断言是哪张图） */
+function pngResponse(hash = '') {
+    const buf = Buffer.alloc(4096, 0);
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+    Buffer.from(`PNG:${hash}`, 'utf8').copy(buf, 8);
     return {
         ok: true,
         status: 200,
@@ -118,13 +119,13 @@ globalThis.fetch = async (url, init = {}) => {
     if (u.includes('/api/qqbot/pay/render-url')) {
         return jsonResponse({ ok: true, url: 'https://xuanjian.top/api/pay/render/summary.png?exp=1790000000&sig=abc123', expiresIn: 600 });
     }
-    // 帮助图本体：机器人会把它下载到 data/help-cards/，之后 #help 直接发本地文件
+    // 帮助图本体：机器人会把它下载到 data/help-cards/，之后 #help 直接发本地图片（base64:// 内联）
     if (u.includes('/api/render/help/')) {
         mock.helpImageFetches += 1;
         if (mock.helpImageFail) {
             return { ok: false, status: 502, headers: new Map(), arrayBuffer: async () => new ArrayBuffer(0) };
         }
-        return pngResponse();
+        return pngResponse((u.match(/\/api\/render\/help\/([^/]+)\.png/) || [])[1] || '');
     }
     // 指令帮助图：每次成功都换一个 hash/url，便于断言「缓存复用」与「刷新重生」
     if (u.includes('/api/qqbot/pay/help-card')) {
@@ -246,6 +247,15 @@ let pass = 0, fail = 0;
 const check = (name, cond, extra = '') => {
     if (cond) { pass++; console.log(`  ✓ ${name}${extra ? ' · ' + extra : ''}`); }
     else { fail++; console.log(`  ✗ ${name}${extra ? ' · ' + extra : ''}`); }
+};
+
+/** 从「发送出去的图片字段」认出是哪张图：base64:// 解码后取 PNG:<hash> 标记 */
+const imageHashOf = (uri) => {
+    const s = String(uri || '');
+    if (!s.startsWith('base64://')) return '';
+    const text = Buffer.from(s.slice('base64://'.length), 'base64').toString('utf8');
+    const m = text.match(/PNG:(hash\d+)/);
+    return m ? m[1] : '';
 };
 
 const { registerAllCommands } = await import('../dist/handlers/commands.js');
@@ -643,9 +653,22 @@ console.log('\n=== ④ #help 图片输出 ===');
     // 本地图片缓存：官网渲染的 PNG 落到 data/help-cards/，发的是本地文件而不是在线地址
     const localImage1 = path.join(HELP_IMAGE_DIR, 'hash1.png');
     check(
-        'help 发的是本地文件（file:// 绝对路径）',
-        r1.images.some((u) => String(u).startsWith('file://') && String(u).endsWith('/help-cards/hash1.png')),
-        String(r1.images[0] || '无'),
+        'help 发的是本地图片（base64:// 内联，不依赖官网取图）',
+        r1.images.some((u) => String(u).startsWith('base64://')),
+        `${String(r1.images[0] || '无').slice(0, 22)}…`,
+    );
+    check(
+        'help 内联图片就是官网渲染的那张（PNG magic + 内容 hash1）',
+        r1.images.some((u) => {
+            if (!String(u).startsWith('base64://')) return false;
+            const buf = Buffer.from(String(u).slice('base64://'.length), 'base64');
+            return buf.length === 4096 && buf[0] === 0x89 && buf[1] === 0x50 && imageHashOf(u) === 'hash1';
+        }),
+        imageHashOf(r1.images[0]) || '无',
+    );
+    check(
+        'help 不用 file://（NapCat 的 file:// 是内部文件哈希，不是本地路径）',
+        r1.images.every((u) => !String(u).startsWith('file://')),
     );
     check(
         'help 图片已下载到 data/help-cards/hash1.png',
@@ -661,8 +684,8 @@ console.log('\n=== ④ #help 图片输出 ===');
 
     // 缓存：同一份指令清单不再请求官网，直接复用 url + 本地文件
     const r2 = await run(helpEntry, { text: '' });
-    check('help 第二次命中缓存（0 次官网请求）', r2.apiCalls.length === 0 && r2.images.some((u) => String(u).includes('hash1.png')), `${r2.apiCalls.length} 次请求`);
-    check('help 缓存命中仍发本地文件', r2.images.some((u) => String(u).startsWith('file://')), String(r2.images[0] || '无'));
+    check('help 第二次命中缓存（0 次官网请求）', r2.apiCalls.length === 0 && imageHashOf(r2.images[0]) === 'hash1', `${r2.apiCalls.length} 次请求 · ${imageHashOf(r2.images[0]) || '无图'}`);
+    check('help 缓存命中仍发本地图片', r2.images.some((u) => String(u).startsWith('base64://')), `${String(r2.images[0] || '无').slice(0, 20)}…`);
     check('help 缓存命中不重新下载图片', mock.helpImageFetches === 1, `${mock.helpImageFetches} 次`);
     check(
         'help 缓存落盘 data/help-card.json（含 url + hash）',
@@ -682,7 +705,7 @@ console.log('\n=== ④ #help 图片输出 ===');
         'help 本地图丢失 → 自动重下（不再 POST help-card）',
         r2b.apiCalls.length === 1
         && r2b.apiCalls[0].url.includes('/api/render/help/hash1.png')
-        && r2b.images.some((u) => String(u).startsWith('file://')),
+        && r2b.images.some((u) => String(u).startsWith('base64://')),
         r2b.apiCalls.map((c) => c.url.replace('https://xuanjian.top', '')).join(' , ') || '无请求',
     );
     check('help 重下后本地文件恢复', fs.existsSync(localImage1) && fs.statSync(localImage1).size > 100);
@@ -692,15 +715,15 @@ console.log('\n=== ④ #help 图片输出 ===');
     const r3 = await run(helpEntry, { text: '刷新' });
     check(
         'help 刷新 强制重新生成',
-        r3.apiCalls.some((c) => c.url.includes('/api/qqbot/pay/help-card')) && r3.images.some((u) => String(u).includes('hash2.png')),
-        String(r3.images[0] || '无'),
+        r3.apiCalls.some((c) => c.url.includes('/api/qqbot/pay/help-card')) && r3.images.some((u) => imageHashOf(u) === 'hash2'),
+        imageHashOf(r3.images[0]) || '无',
     );
     check('help expiresIn 落盘为 expiresAt', /"expiresAt":\s*\d+/.test(fs.readFileSync(HELP_CACHE_FILE, 'utf8')));
     const r4 = await run(find('指令图'), { text: '' });
     check(
         '#指令图 = 强制刷新',
-        r4.apiCalls.some((c) => c.url.includes('/api/qqbot/pay/help-card')) && r4.images.some((u) => String(u).includes('hash3.png')),
-        String(r4.images[0] || '无'),
+        r4.apiCalls.some((c) => c.url.includes('/api/qqbot/pay/help-card')) && r4.images.some((u) => imageHashOf(u) === 'hash3'),
+        imageHashOf(r4.images[0]) || '无',
     );
     check('help 刷新后再次缓存命中', (await run(helpEntry, { text: '' })).apiCalls.length === 0);
     mock.helpCardExpiresIn = null;
@@ -710,8 +733,8 @@ console.log('\n=== ④ #help 图片输出 ===');
     const stale = await run(helpEntry, { text: '刷新' });
     check(
         'help 官网 500 + 有缓存 → 仍发旧图（不降级文字）',
-        stale.apiCalls.length === 1 && stale.images.some((u) => String(u).includes('hash3.png')),
-        String(stale.images[0] || '无'),
+        stale.apiCalls.length === 1 && stale.images.some((u) => imageHashOf(u) === 'hash3'),
+        imageHashOf(stale.images[0]) || '无',
     );
 
     // 官网故障 + 无缓存 → 回退原文字列表（格式与改造前一致）

@@ -4,12 +4,11 @@
 import { registerCommand, getCommands } from '../core/command.js';
 import type { CommandContext } from '../core/command.js';
 import { Structs } from 'node-napcat-ts';
-import { pathToFileURL } from 'url';
 import * as api from '../services/officialApi.js';
 import { isAdmin, config } from '../config.js';
 import { activityRanking } from '../services/activity.js';
 import { buildSummaryBroadcast } from '../services/payBroadcast.js';
-import { getHelpCard, helpCardCaption } from '../services/helpCard.js';
+import { getHelpCard, helpCardCaption, localImageAsBase64Uri } from '../services/helpCard.js';
 import {
   DEFAULT_WELCOME_TEXT,
   MAX_WELCOME_TEXT_LENGTH,
@@ -50,10 +49,10 @@ export function registerAllCommands() {
       const card = await getHelpCard(force);
       if (card.ok) {
         const caption = helpCardCaption(card.count);
-        // 优先发本地文件：图已经在机器人服务器上（data/help-cards/），不用让 NapCat 再去官网拉一次
-        const local = card.localPath ? pathToFileURL(card.localPath).href : '';
+        // 优先发本地图片（base64:// 内联，图已在机器人服务器上，不用让 NapCat 再去官网拉）
+        const local = card.localPath ? localImageAsBase64Uri(card.localPath) : null;
         if (local && (await trySendImageReply(ctx, local, caption))) return;
-        // 本地不可用或发本地失败（如 NapCat 读不到该路径）→ 再用在线地址兜一次
+        // 本地不可用或发本地失败 → 再用官网在线地址兜一次
         if (card.url && (await trySendImageReply(ctx, card.url, caption))) return;
       }
     } catch (e) {

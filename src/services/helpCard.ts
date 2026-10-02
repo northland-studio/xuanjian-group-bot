@@ -2,8 +2,8 @@
  * 指令帮助图（#help 图片输出）
  *
  * 流程：getCommands() 取全部指令与别名 → 本地按功能分组 → POST 官网 /api/qqbot/pay/help-card
- *      → 把官网渲染好的 png **下载到本地** data/help-cards/<hash>.png → 之后 #help 直接发本地文件，
- *        不再每次都让 NapCat 去拉 online 地址；下载失败则退回发在线地址，官网全挂时由调用方回退文字列表。
+ *      → 把官网渲染好的 png **下载到本地** data/help-cards/<hash>.png → 之后 #help 发本地图（base64:// 内联，
+ *        不必让 NapCat 再去官网拉图）；下载失败则退回发在线地址，官网全挂时由调用方回退文字列表。
  *
  * 分组是「规则匹配」而不是硬编码指令清单：新增指令只要名字/描述命中规则就会自动归组，
  * 没有命中的落到「其它指令」。规则顺序固定 → 分组结果稳定（同样的指令清单必然得到同一张图，
@@ -11,7 +11,7 @@
  *
  * 缓存两级：
  *   1) data/help-card.json —— 指令清单签名 + 图片地址/hash（清单没变且图片没过期就不请求官网）；
- *   2) data/help-cards/<hash>.png —— 图片本体，本地文件在就发本地文件。
+ *   2) data/help-cards/<hash>.png —— 图片本体，本地文件在就以 base64:// 内联发送。
  * `#help 刷新` 会跳过缓存重新生成（重新 POST + 重新下载）。
  */
 import fs from 'fs';
@@ -241,6 +241,25 @@ async function ensureLocalImage(url: string, hash?: string, cachedPath?: string 
 export function localHelpImagePath(): string | null {
   const c = memory || loadCache();
   return c && localImageOk(c.localPath) ? c.localPath : null;
+}
+
+/**
+ * 把本地帮助图转成 OneBot 通用的内联图片：`base64://<数据>`。
+ *
+ * 为什么不直接发 `file://` 路径：NapCat 的 `file://` 是「内部文件哈希 ID」（如 file://1234567890），
+ * 不是文件系统路径 —— 发 `file:///var/www/...png` 只会查找失败；而绝对路径直接发又依赖
+ * NapCat 的 enableLocalFile2Url（本机为 false）。`base64://` 是 NapCat 明确支持的资源规范，
+ * 与配置无关，代价是每张图多 ~33% 体积（帮助图约 340KB → 460KB，发图频率很低，可接受）。
+ */
+export function localImageAsBase64Uri(file: string): string | null {
+  try {
+    const buf = fs.readFileSync(file);
+    if (buf.length <= 8 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) return null;
+    return `base64://${buf.toString('base64')}`;
+  } catch (e) {
+    console.error('[help] 读取本地帮助图失败（改发在线地址）:', (e as Error)?.message || e);
+    return null;
+  }
 }
 
 /* ==================== 缓存 ==================== */
