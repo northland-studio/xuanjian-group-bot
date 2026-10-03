@@ -2,6 +2,7 @@
  * 群指令实现（查询 + 拓展功能）
  */
 import { registerCommand, getCommands } from '../core/command.js';
+import { registerWikiCommands } from './wiki.js';
 import type { CommandContext } from '../core/command.js';
 import { Structs } from 'node-napcat-ts';
 import * as api from '../services/officialApi.js';
@@ -42,6 +43,9 @@ function requireAdmin(qq: string, reply: (s: string) => void): boolean {
 }
 
 export function registerAllCommands() {
+  // Wiki 词条：搜索 + 出图（含 `#[序号]` 兜底），单独放一个文件免得这里继续膨胀
+  registerWikiCommands();
+
   // 帮助：优先发官网生成的指令总览图；官网/发图任一失败都退回原来的文字列表。
   // `#help 刷新`（或 `#指令图`）跳过缓存强制重新生成。
   const sendHelpCard = async (ctx: CommandContext, force: boolean) => {

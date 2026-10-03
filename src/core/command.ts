@@ -33,6 +33,16 @@ interface CommandEntry {
 
 const commands: CommandEntry[] = [];
 
+/**
+ * 兜底处理器：没有匹配到具名指令时才会走到这里（例如 `#[3]` 这种"选第几条"）。
+ * 单独存放，不进 commands 数组，所以不会出现在 #help 的指令清单里。
+ */
+let fallbackHandler: CommandHandler | null = null;
+
+export function setFallbackHandler(handler: CommandHandler) {
+  fallbackHandler = handler;
+}
+
 export function registerCommand(name: string, aliases: string[], desc: string, handler: CommandHandler) {
   commands.push({ name, aliases, desc, handler });
 }
@@ -70,6 +80,16 @@ export function parseCommand(raw: string, isPrivate: boolean): { entry: CommandE
   const entry = commands.find(
     (c) => c.name.toLowerCase() === keyword || c.aliases.some((a) => a.toLowerCase() === keyword),
   );
-  if (!entry) return null;
+  if (!entry) {
+    // 兜底：`#[3]` 或 `#3` 这类"选第几条"的写法交给 fallbackHandler（不进指令清单）
+    const sigil = keyword.replace(/^\[|\]$/g, '');
+    if (fallbackHandler && /^\d{1,2}$/.test(sigil)) {
+      return {
+        entry: { name: '__index__', aliases: [], desc: '', handler: fallbackHandler },
+        args: sigil,
+      };
+    }
+    return null;
+  }
   return { entry, args };
 }

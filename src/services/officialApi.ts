@@ -99,6 +99,16 @@ export async function getPosts(type: string, limit = 5) {
 }
 
 /**
+ * Wiki 词条搜索（官网公开接口，只返回已发布词条）
+ * 返回 { ok, q, total, items[] } 或 null；items 里含 id/title/slug/summary/category_name。
+ */
+export async function searchWiki(keyword: string, limit = 6) {
+  const q = String(keyword || '').trim();
+  if (!q) return null;
+  return get<any>(`/api/wiki/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+}
+
+/**
  * 核销码验证（群内普通成员可查核销信息与状态）
  * 依赖官网 bot-token 接口 /api/qqbot/verify-code
  * 核销码绑定消费用户，持码即可查询，无需身份验证。
